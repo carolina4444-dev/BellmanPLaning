@@ -1,0 +1,59 @@
+The bedroom is cold.
+The robot enters the bedroom.
+The robot turns on the heater.
+The bedroom begins warming.
+The bedroom is warm.
+
+The kitchen is dirty.
+The robot enters the kitchen.
+The robot picks up the cleaning supplies.
+The robot cleans the kitchen.
+The kitchen is clean.
+
+The living room is dark.
+The robot enters the living room.
+The robot finds the light switch.
+The robot turns on the light.
+The living room is bright.
+
+The plant is dry.
+The robot approaches the plant.
+The robot picks up the watering can.
+The robot waters the plant.
+The plant is healthy.
+
+The cup is empty.
+The robot approaches the cup.
+The robot picks up the cup.
+The robot fills the cup with water.
+The cup is full.
+
+The door is closed.
+The robot approaches the door.
+The robot reaches for the handle.
+The robot opens the door.
+The door is open.
+
+The desk is messy.
+The robot approaches the desk.
+The robot collects the scattered papers.
+The robot organizes the papers.
+The desk is organized.
+
+The room is cold.
+The robot enters the room.
+The robot closes the window.
+The robot turns on the heater.
+The room is warm.
+
+The floor is dirty.
+The robot enters the room.
+The robot picks up the vacuum.
+The robot vacuums the floor.
+The floor is clean.
+
+The book is on the floor.
+The robot approaches the book.
+The robot picks up the book.
+The robot carries the book to the shelf.
+The book is on the shelf.
