@@ -2235,6 +2235,15 @@ class GroundedHierarchicalPlanDecoder(layers.Layer):
             activation="gelu",
         )
 
+        self.previous_sentence_fusion = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
+
         self.previous_sentence_gate = layers.Dense(
             D_MODEL,
             activation="sigmoid",
@@ -2560,17 +2569,13 @@ class GroundedHierarchicalPlanDecoder(layers.Layer):
         Decode one token.
         """
 
-        # GRUCell state is always [batch, hidden].
-        if token_state.shape.rank == 3:
-            token_state = tf.squeeze(token_state, axis=1)
-
         token_x = self.token_embedding(token_ids)
 
         token_x = self.token_fusion(
             tf.concat(
                 [
                     token_x,
-                    tf.squeeze(sentence_context, axis=1),
+                    sentence_context,
                 ],
                 axis=-1,
             )
@@ -2698,17 +2703,7 @@ class GroundedHierarchicalPlanDecoder(layers.Layer):
 
             previous_x = previous_x * gate
 
-            if current_sentence_context.shape.rank == 2:
-                current_sentence_context = tf.expand_dims(
-                    current_sentence_context, axis=1
-                )
-
-            if previous_x.shape.rank == 2:
-                previous_x = tf.expand_dims(
-                    previous_x, axis=1
-                )
-
-            current_sentence_context = self.sentence_fusion(
+            current_sentence_context = self.previous_sentence_fusion(
                 tf.concat(
                     [
                         current_sentence_context,
