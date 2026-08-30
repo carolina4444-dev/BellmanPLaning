@@ -3630,6 +3630,16 @@ class BellmanLatentPlanner(tf.keras.Model):
             min_tokens=MIN_GENERATION_TOKENS,
         )
 
+        return {
+            "generated_ids": generated_ids,
+            "actions": recursive["actions"],
+            "q_values": recursive["q_values"],
+            "predicted_states": recursive["states"],
+            "termination_logits": recursive["termination_logits"],
+            "final_state": recursive["final_state"],
+            "goal": goal,
+        }
+
 # ============================================================
 # LOSSES
 # ============================================================
