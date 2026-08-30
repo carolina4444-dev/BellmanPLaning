@@ -73,6 +73,7 @@ W_ACTION_SEPARATION = 0.35
 W_RECURSIVE_ACTION = 1.25
 W_PLAN_ALIGNMENT = 1.50
 W_PLAN_LANGUAGE_ALIGNMENT = 2.0
+W_TERMINATION = 1.0
 
 LABEL_SMOOTHING = 0.04
 REPETITION_PENALTY = 1.0
@@ -214,6 +215,15 @@ def make_dataset(examples, vectorizer, depth, batch_size):
     horizons = np.asarray([x["horizon"] for x in examples], dtype=np.float32)
     step_idx = np.arange(depth, dtype=np.float32)[None, :]
     step_mask = (step_idx < horizons[:, None]).astype(np.float32)
+    termination_targets = np.zeros(
+        (n, depth),
+        dtype=np.float32,
+    )
+
+    for i, horizon in enumerate(horizons.astype(np.int32)):
+        if horizon > 0:
+            termination_targets[i, horizon - 1] = 1.0
+
 
     ds = tf.data.Dataset.from_tensor_slices({
         "state_ids": state_ids,
@@ -223,6 +233,7 @@ def make_dataset(examples, vectorizer, depth, batch_size):
         "action_ids": action_ids,
         "step_mask": step_mask,
         "augmented_state_ids": augmented_state_ids,
+        "termination_targets": termination_targets,
     })
     return ds.shuffle(
         min(n, 4096), seed=SEED, reshuffle_each_iteration=True
@@ -556,6 +567,11 @@ class PlanEmbeddingModel(layers.Layer):
             layers.LayerNormalization(),
         ])
 
+        self.action_gate = layers.Dense(
+            D_PLAN,
+            activation="sigmoid",
+        )
+
     def call(
         self,
         state,
@@ -567,6 +583,14 @@ class PlanEmbeddingModel(layers.Layer):
         state_x = self.state_net(state)
         action_x = self.action_net(action)
 
+        goal_x = self.goal_net(goal)
+
+        action_gate = self.action_gate(
+            tf.concat([state_x, goal_x], axis=-1)
+        )
+
+        action_x = action_x * action_gate
+
         transition_x = self.transition_net(
             next_state - state
         )
@@ -575,7 +599,7 @@ class PlanEmbeddingModel(layers.Layer):
             next_state
         )
 
-        goal_x = self.goal_net(goal)
+        
 
         # Always present Q as [N, 1].
         q = tf.reshape(q, [-1, 1])
@@ -740,6 +764,11 @@ class RecursiveBellmanPlanner(layers.Layer):
         # Used to determine how strongly an observed action should anchor
         # candidate selection during training.
         self.anchor_temperature = 0.08
+
+        self.termination_head = tf.keras.Sequential([
+            layers.Dense(D_MODEL, activation="gelu"),
+            layers.Dense(1),
+        ])
 
     # ------------------------------------------------------------
     # Candidate evaluation
@@ -1083,6 +1112,22 @@ class RecursiveBellmanPlanner(layers.Layer):
             axis=-1,
         )
 
+        termination_features = tf.concat(
+            [
+                state,
+                predicted_next_state,
+                selected_action,
+                predicted_reward[..., None],
+                predicted_q[..., None],
+                goal,
+            ],
+            axis=-1,
+        )
+
+        termination_logit = self.termination_head(
+            termination_features
+        )[..., 0]
+
         return {
             "state": state,
             "action": selected_action,
@@ -1101,6 +1146,8 @@ class RecursiveBellmanPlanner(layers.Layer):
             "candidate_logits": proposal_logits,
             "candidate_weights": weights,
             "selected_index": selected_index,
+
+            "termination_logit": termination_logit,
         }
 
     # ------------------------------------------------------------
@@ -1117,6 +1164,7 @@ class RecursiveBellmanPlanner(layers.Layer):
         step_mask=None,
         training=False,
         hard=False,
+        teacher_forcing=True
     ):
         """
         Construct an ordered trajectory of plan embeddings.
@@ -1149,9 +1197,11 @@ class RecursiveBellmanPlanner(layers.Layer):
         rewards = []
         values = []
         q_values = []
+        termination_logits = []
         candidate_weights = []
         candidate_q_values = []
         selected_indices = []
+        candidate_actions = []
 
         for t in range(depth):
             source_state = current_state
@@ -1183,6 +1233,7 @@ class RecursiveBellmanPlanner(layers.Layer):
             rewards.append(result["reward"])
             values.append(result["value"])
             q_values.append(result["q_value"])
+            termination_logits.append(result["termination_logit"])
 
             candidate_weights.append(
                 result["candidate_weights"]
@@ -1194,6 +1245,10 @@ class RecursiveBellmanPlanner(layers.Layer):
 
             selected_indices.append(
                 result["selected_index"]
+            )
+
+            candidate_actions.append(
+                result["candidate_actions"]
             )
 
             current_state = result["next_state"]
@@ -1226,6 +1281,11 @@ class RecursiveBellmanPlanner(layers.Layer):
             ),
 
             "final_state": current_state,
+
+            "termination_logits": tf.stack(
+                termination_logits,
+                axis=1,
+            ),
         }
 
 def sample_token(logits, temperature=0.75, top_k=30):
@@ -1444,7 +1504,7 @@ class HierarchicalPlanDecoder(layers.Layer):
 
             context = contexts[:, step_idx, :]
 
-            state = self.context_projection(context)
+            state = context
 
             current = tf.fill(
                 [b],
@@ -1579,6 +1639,54 @@ def ids_to_text(ids, vectorizer):
                 output.append(token)
     return " ".join(output)
 
+def candidate_action_alignment_loss_per_step(
+    candidate_actions,
+    observed_actions,
+    step_mask,
+):
+    """
+    Candidate action supervision for every recursive planning step.
+
+    candidate_actions:
+        [B, K, D_ACTION]
+
+    observed_actions:
+        [B, T, D_ACTION]
+    """
+
+    candidate_actions = tf.math.l2_normalize(
+        candidate_actions,
+        axis=-1,
+    )
+
+    observed_actions = tf.math.l2_normalize(
+        tf.stop_gradient(observed_actions),
+        axis=-1,
+    )
+
+    # candidate_actions are generated from the current state only.
+    # This function is intended to be called once per recursive step.
+    similarity = tf.einsum(
+        "bkd,bd->bk",
+        candidate_actions,
+        observed_actions,
+    )
+
+    labels = tf.stop_gradient(
+        tf.argmax(similarity, axis=-1)
+    )
+
+    loss = tf.keras.losses.sparse_categorical_crossentropy(
+        labels,
+        similarity / 0.08,
+        from_logits=True,
+    )
+
+    return masked_mean(
+        loss,
+        step_mask,
+    )
+
 
 # ============================================================
 # FULL MODEL
@@ -1610,6 +1718,12 @@ class BellmanLatentPlanner(tf.keras.Model):
             self.value_model,
             self.plan_embedding_model,
         )
+
+        self.sentence_fusion = tf.keras.Sequential([
+            layers.Dense(2 * D_MODEL, activation="gelu"),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
 
     def encode(self, ids, training=False):
         return self.encoder(ids, training=training)
@@ -1680,27 +1794,54 @@ class BellmanLatentPlanner(tf.keras.Model):
         reward = self.reward_model( state, observed_action, predicted_next_state, goal, ) 
         state_value = self.value_model( state, goal, ) 
         next_value = self.value_model( predicted_next_state, goal, ) 
-        recursive = self.planner.plan( state=state, goal=goal, depth=self.depth, observed_actions=observed_actions, observed_next_states=observed_next_states, step_mask=step_mask, training=training, )
-        sentence_plan = self.plan_sentence_projection(recursive["plan"])
 
+        recursive = self.planner.plan(
+            state=state,
+            goal=goal,
+            depth=self.depth,
+            observed_actions=observed_actions,
+            observed_next_states=observed_next_states,
+            step_mask=step_mask,
+            training=training,
+        )
+
+        plan_sentence = self.plan_sentence_projection(
+            recursive["plan"]
+        )
+
+        # Project recursive actions into the language-decoder space.
         recursive_action_plan = self.action_plan_projection(
             recursive["actions"]
+        )
+
+        action_sentence = recursive_action_plan
+
+        sentence_plan = self.sentence_fusion(
+            tf.concat(
+                [plan_sentence, action_sentence],
+                axis=-1,
+            )
+        )
+
+        sentence_plan = tf.math.l2_normalize(
+            sentence_plan,
+            axis=-1,
         )
 
         decoder_full = add_eos(inputs["action_ids"])
         decoder_inputs = decoder_full[:, :, :-1]
         decoder_targets = decoder_full[:, :, 1:]
-        decoder_logits = self.decoder(sentence_plan, decoder_inputs, training=training)
+
+        decoder_logits = self.decoder(
+            sentence_plan,
+            decoder_inputs,
+            training=training,
+        )
 
         augmented_state = self.encode(
             inputs["augmented_state_ids"],
             training=training,
         )["state"]
-
-        predicted_next_state = self.transition_model(
-            state,
-            observed_action,
-        )
 
         return {
             "state": state,
@@ -1727,6 +1868,9 @@ class BellmanLatentPlanner(tf.keras.Model):
             "decoder_targets": decoder_targets,
             "step_mask": step_mask,
             "augmented_state": augmented_state,
+
+            "termination_logits": recursive["termination_logits"],
+            "termination_targets": inputs["termination_targets"],
         }
 
     def generate_plan(self, state_ids, goal_ids, depth):
@@ -2007,7 +2151,27 @@ def plan_action_alignment_loss(
         step_mask,
     )
 
+
+def termination_loss(logits, targets, step_mask):
+    targets = tf.cast(targets, tf.float32)
+    step_mask = tf.cast(step_mask, tf.float32)
+
+    positive_weight = 3.0
+
+    loss = tf.nn.weighted_cross_entropy_with_logits(
+        labels=targets,
+        logits=logits,
+        pos_weight=positive_weight,
+    )
+
+    return masked_mean(loss, step_mask)
+
 def compute_total_loss(outputs, transition_model):
+    l_termination = termination_loss(
+        outputs["recursive_plan"]["termination_logits"],
+        outputs["termination_targets"],
+        outputs["step_mask"],
+    )
     l_transition = transition_loss(
         outputs["predicted_next_state"], outputs["observed_next_states"][:, 0, :]
     )
@@ -2086,7 +2250,9 @@ def compute_total_loss(outputs, transition_model):
         + W_RECURSIVE_ACTION * l_recursive_action
         + W_PLAN_ALIGNMENT * l_plan_alignment
         + W_PLAN_LANGUAGE_ALIGNMENT * l_text_alignment_loss
+        + W_TERMINATION * l_termination
     )
+
     return total, {
         "transition": l_transition,
         "recursive_state": l_recursive_state,
@@ -2102,6 +2268,7 @@ def compute_total_loss(outputs, transition_model):
         "candidate_transition": l_candidate_transition,
         "candidate_diversity": l_candidate_diversity,
         "action_separation": l_action_separation,
+        "termination": l_termination,
     }
 
 
@@ -2179,7 +2346,7 @@ def train_from_file(data_path, epochs, batch_size, depth):
         "total", "transition", "recursive_state", "recursive_transition", "bellman",
         "terminal_goal", "plan_goal", "decoder", "action_language", "temporal_action_nce",
         "contrast", "candidate_action", "candidate_transition", "candidate_diversity",
-        "action_separation",
+        "action_separation", "termination",
     ]
 
     for epoch in range(epochs):
