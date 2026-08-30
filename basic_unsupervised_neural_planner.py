@@ -2923,7 +2923,7 @@ class GroundedHierarchicalPlanDecoder(layers.Layer):
 
             previous_x = previous_x * gate
 
-            current_context = self.sentence_fusion(
+            current_context = self.previous_sentence_fusion(
                 tf.concat(
                     [
                         current_context,
@@ -3328,7 +3328,19 @@ class BellmanLatentPlanner(tf.keras.Model):
         )
 
         self.sentence_fusion = tf.keras.Sequential([
-            layers.Dense(2 * D_MODEL, activation="gelu"),
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
+
+        self.previous_sentence_fusion = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
             layers.Dense(D_MODEL),
             layers.LayerNormalization(),
         ])
