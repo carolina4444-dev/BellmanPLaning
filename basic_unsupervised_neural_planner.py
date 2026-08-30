@@ -1288,21 +1288,74 @@ class RecursiveBellmanPlanner(layers.Layer):
             ),
         }
 
-def sample_token(logits, temperature=0.75, top_k=30):
-    logits = logits / temperature
+def sample_token(
+    logits,
+    temperature=0.65,
+    top_k=40,
+    top_p=0.92,
+):
+    """
+    Temperature + top-k + nucleus sampling.
 
-    values, indices = tf.math.top_k(
+    Much more stable than sampling directly from the full vocabulary.
+    """
+
+    logits = logits / max(float(temperature), 1e-5)
+
+    vocab = tf.shape(logits)[-1]
+
+    # ------------------------------------------------------------
+    # Top-k
+    # ------------------------------------------------------------
+
+    k = tf.minimum(
+        tf.cast(top_k, tf.int32),
+        vocab,
+    )
+
+    top_values, top_indices = tf.math.top_k(
         logits,
-        k=top_k,
+        k=k,
+    )
+
+    # ------------------------------------------------------------
+    # Top-p / nucleus filtering
+    # ------------------------------------------------------------
+
+    sorted_probs = tf.nn.softmax(top_values, axis=-1)
+
+    cumulative = tf.cumsum(
+        sorted_probs,
+        axis=-1,
+    )
+
+    keep = cumulative <= top_p
+
+    # Always retain at least the best token.
+    keep = tf.concat(
+        [
+            tf.ones_like(keep[:, :1], dtype=tf.bool),
+            keep[:, 1:],
+        ],
+        axis=1,
+    )
+
+    filtered_values = tf.where(
+        keep,
+        top_values,
+        tf.fill(
+            tf.shape(top_values),
+            tf.cast(-1e9, top_values.dtype),
+        ),
     )
 
     sampled = tf.random.categorical(
-        values,
+        filtered_values,
         num_samples=1,
     )[:, 0]
 
     return tf.gather(
-        indices,
+        top_indices,
         sampled,
         batch_dims=1,
     )
@@ -1311,64 +1364,160 @@ def sample_token(logits, temperature=0.75, top_k=30):
 # HIERARCHICAL DECODER
 # ============================================================
 class HierarchicalPlanDecoder(layers.Layer):
-    """Step-level GRU followed by an autoregressive token GRU.
-
-    Training and inference use the same GRUCell transition. The decoder input
-    is explicitly CLS/content/EOS shifted, so EOS is actually supervised.
     """
+    Hierarchical autoregressive decoder.
+
+    Level 1:
+        plan embeddings -> ordered sentence contexts
+
+    Level 2:
+        sentence context + previous sentence context
+        -> autoregressive token generation
+
+    Training and inference share the same GRUCell transition.
+    """
+
     def __init__(self, vocab_size, max_depth):
         super().__init__()
+
         self.vocab_size = vocab_size
         self.max_depth = max_depth
-        self.step_embedding = layers.Embedding(max_depth, D_MODEL)
+
+        # --------------------------------------------------------
+        # Sentence / plan level
+        # --------------------------------------------------------
+
+        self.step_embedding = layers.Embedding(
+            max_depth,
+            D_MODEL,
+        )
+
         self.plan_norm = layers.LayerNormalization()
-        self.step_gru = layers.GRU(D_MODEL, return_sequences=True)
-        self.token_embedding = layers.Embedding(vocab_size, D_MODEL)
-        self.context_projection = layers.Dense(
+
+        self.step_gru = layers.GRU(
+            D_MODEL,
+            return_sequences=True,
+        )
+
+        # Previous sentence -> current sentence conditioning.
+        self.previous_sentence_projection = layers.Dense(
             D_MODEL,
             activation="gelu",
         )
 
-        self.context_gate = layers.Dense(
+        self.sentence_fusion = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
+
+        # --------------------------------------------------------
+        # Token level
+        # --------------------------------------------------------
+
+        self.token_embedding = layers.Embedding(
+            vocab_size,
+            D_MODEL,
+        )
+
+        self.token_context_fusion = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
+
+        self.token_gru_cell = layers.GRUCell(
+            D_MODEL,
+        )
+
+        self.output_norm = layers.LayerNormalization()
+
+        self.output_head = layers.Dense(
+            vocab_size,
+        )
+
+        # Learnable EOS preference.
+        self.eos_bias = self.add_weight(
+            name="eos_bias",
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.35),
+            trainable=True,
+        )
+
+        # Controls how strongly previous sentence information enters.
+        self.previous_sentence_gate = layers.Dense(
             D_MODEL,
             activation="sigmoid",
         )
 
-        self.token_fusion = layers.Dense(
-            D_MODEL,
-            activation="gelu",
-        )
-        self.token_norm = layers.LayerNormalization()
-        self.token_gru_cell = layers.GRUCell(D_MODEL)
-        self.output_norm = layers.LayerNormalization()
-        self.output_head = layers.Dense(vocab_size)
-        self.eos_bias = self.add_weight(
-            name="eos_bias", shape=(), initializer=tf.keras.initializers.Constant(0.5), trainable=True
-        )
+    # ============================================================
+    # SENTENCE LEVEL
+    # ============================================================
 
-    def compute_step_contexts(self, plan_sequence, training=False):
+    def compute_step_contexts(
+        self,
+        plan_sequence,
+        training=False,
+    ):
         depth = tf.shape(plan_sequence)[1]
-        pos = self.step_embedding(tf.range(depth)[None, :])
-        x = self.plan_norm(plan_sequence + pos)
-        return self.step_gru(x, training=training)
 
-    def _prepare_token_input(self, token_ids, context):
-        token_x = self.token_embedding(token_ids)
+        positions = tf.range(depth)
+
+        position_embedding = self.step_embedding(
+            positions
+        )[None, :, :]
+
+        x = self.plan_norm(
+            plan_sequence + position_embedding
+        )
+
+        return self.step_gru(
+            x,
+            training=training,
+        )
+
+    # ============================================================
+    # TOKEN INPUT
+    # ============================================================
+
+    def _prepare_token_input(
+        self,
+        token_ids,
+        context,
+    ):
+        token_x = self.token_embedding(
+            token_ids
+        )
+
+        if context.shape.rank == 2:
+            context_tokens = context[:, None, :]
+        else:
+            context_tokens = context
 
         context_tokens = tf.broadcast_to(
-            context[:, None, :],
+            context_tokens,
             tf.shape(token_x),
         )
 
-        x = self.token_fusion(
+        return self.token_context_fusion(
             tf.concat(
-                [token_x, context_tokens],
+                [
+                    token_x,
+                    context_tokens,
+                ],
                 axis=-1,
             )
         )
 
-        return self.token_norm(x)
-
+    # ============================================================
+    # TEACHER FORCING
+    # ============================================================
 
     def _teacher_force_logits(
         self,
@@ -1376,9 +1525,23 @@ class HierarchicalPlanDecoder(layers.Layer):
         decoder_input_ids,
         training=False,
     ):
+        """
+        decoder_input_ids:
+
+            [B, depth, T]
+
+        Returns:
+
+            [B, depth, T, vocab]
+        """
+
         b = tf.shape(step_contexts)[0]
         depth = tf.shape(step_contexts)[1]
         t = tf.shape(decoder_input_ids)[2]
+
+        # --------------------------------------------------------
+        # Flatten sentence dimension.
+        # --------------------------------------------------------
 
         flat_context = tf.reshape(
             step_contexts,
@@ -1390,96 +1553,203 @@ class HierarchicalPlanDecoder(layers.Layer):
             [b * depth, t],
         )
 
-        x = self._prepare_token_input(
+        # --------------------------------------------------------
+        # Process each sentence independently at token level.
+        # --------------------------------------------------------
+
+        token_x = self._prepare_token_input(
             flat_ids,
             flat_context,
         )
 
         state = flat_context
+
         outputs = []
 
         for i in range(MAX_SEQ_LEN - 1):
+
             yi, states = self.token_gru_cell(
-                x[:, i, :],
+                token_x[:, i, :],
                 [state],
                 training=training,
             )
-            state = states[0]
-            outputs.append(yi)
 
-        y = self.output_norm(
-            tf.stack(outputs, axis=1)
+            state = states[0]
+
+            outputs.append(
+                yi
+            )
+
+        y = tf.stack(
+            outputs,
+            axis=1,
         )
+
+        y = self.output_norm(y)
 
         logits = self.output_head(y)
 
         return tf.reshape(
             logits,
-            [b, depth, MAX_SEQ_LEN - 1, self.vocab_size],
+            [
+                b,
+                depth,
+                MAX_SEQ_LEN - 1,
+                self.vocab_size,
+            ],
         )
 
+    # ============================================================
+    # TRAINING CALL
+    # ============================================================
 
-    def call(self, plan_sequence, decoder_input_ids, training=False):
-        contexts = self.compute_step_contexts(plan_sequence, training=training)
-        return self._teacher_force_logits(contexts, decoder_input_ids, training=training)
+    def call(
+        self,
+        plan_sequence,
+        decoder_input_ids,
+        training=False,
+    ):
+        contexts = self.compute_step_contexts(
+            plan_sequence,
+            training=training,
+        )
 
-    def _apply_generation_constraints(self, logits, generated, step):
+        return self._teacher_force_logits(
+            contexts,
+            decoder_input_ids,
+            training=training,
+        )
+
+    # ============================================================
+    # REPETITION CONTROL
+    # ============================================================
+
+    def _apply_repetition_penalty(
+        self,
+        logits,
+        generated,
+        penalty=1.0,
+    ):
+        if not generated:
+            return logits
+
         logits = tf.identity(logits)
-        for token_id in (PAD_ID, MASK_ID, CLS_ID):
-            ids = tf.fill([tf.shape(logits)[0]], tf.cast(token_id, tf.int32))
-            idx = tf.stack([tf.range(tf.shape(logits)[0]), ids], axis=1)
-            logits = tf.tensor_scatter_nd_update(
-                logits, idx, tf.fill([tf.shape(logits)[0]], tf.cast(-1e9, logits.dtype))
-            )
 
-        eos_ids = tf.fill([tf.shape(logits)[0]], tf.cast(EOS_ID, tf.int32))
-        eos_idx = tf.stack([tf.range(tf.shape(logits)[0]), eos_ids], axis=1)
-        if step < MIN_GENERATION_TOKENS:
-            logits = tf.tensor_scatter_nd_update(
-                logits, eos_idx, tf.fill([tf.shape(logits)[0]], tf.cast(-1e9, logits.dtype))
-            )
-        else:
-            logits = tf.tensor_scatter_nd_add(
-                logits, eos_idx, tf.fill([tf.shape(logits)[0]], tf.cast(self.eos_bias, logits.dtype))
-            )
+        # Penalize all previously generated tokens.
+        history = tf.stack(
+            generated,
+            axis=1,
+        )
 
-        if generated:
-            previous = generated[-1]
+        history = tf.cast(
+            history,
+            tf.int32,
+        )
 
-            idx = tf.stack(
-                [
-                    tf.range(tf.shape(logits)[0]),
-                    previous,
-                ],
-                axis=1,
-            )
+        one_hot = tf.one_hot(
+            history,
+            self.vocab_size,
+        )
 
-            logits = tf.tensor_scatter_nd_add(
-                logits,
-                idx,
-                tf.fill(
-                    [tf.shape(logits)[0]],
-                    tf.cast(-REPETITION_PENALTY, logits.dtype),
-                ),
-            )
+        seen = tf.reduce_max(
+            one_hot,
+            axis=1,
+        )
 
-        if BIGRAM_BLOCKING and len(generated) >= 2:
-            seq = tf.stack(generated, axis=1).numpy()
-            masks = []
-            for row in seq:
-                previous = int(row[-1])
-                forbidden = {
-                    int(row[j + 1]) for j in range(len(row) - 1) if int(row[j]) == previous
-                }
-                mask = np.zeros(self.vocab_size, dtype=np.float32)
-                for token_id in forbidden:
-                    if 0 <= token_id < self.vocab_size:
-                        mask[token_id] = 1.0
-                masks.append(mask)
-            logits -= tf.convert_to_tensor(np.asarray(masks), dtype=logits.dtype) * tf.cast(1e9, logits.dtype)
+        logits = logits - (
+            seen * penalty
+        )
+
         return logits
 
-    def generate(self, plan_sequence, max_length=MAX_SEQ_LEN):
+    # ============================================================
+    # BIGRAM BLOCKING
+    # ============================================================
+
+    def _apply_bigram_blocking(
+        self,
+        logits,
+        generated,
+    ):
+        if len(generated) < 2:
+            return logits
+
+        batch_size = int(
+            tf.shape(logits)[0].numpy()
+        )
+
+        sequences = tf.stack(
+            generated,
+            axis=1,
+        ).numpy()
+
+        masks = np.zeros(
+            [
+                batch_size,
+                self.vocab_size,
+            ],
+            dtype=np.float32,
+        )
+
+        for b in range(batch_size):
+
+            seq = sequences[b].tolist()
+
+            previous = seq[-1]
+
+            forbidden = set()
+
+            for i in range(
+                len(seq) - 1
+            ):
+                if seq[i] == previous:
+                    forbidden.add(
+                        seq[i + 1]
+                    )
+
+            for token_id in forbidden:
+                if (
+                    0 <= token_id
+                    < self.vocab_size
+                ):
+                    masks[
+                        b,
+                        token_id,
+                    ] = 1.0
+
+        return logits - (
+            tf.convert_to_tensor(
+                masks,
+                dtype=logits.dtype,
+            )
+            * 1e9
+        )
+
+    # ============================================================
+    # GENERATION
+    # ============================================================
+
+    def generate(
+        self,
+        plan_sequence,
+        max_length=MAX_SEQ_LEN,
+        temperature=0.60,
+        top_k=40,
+        top_p=0.92,
+        greedy=False,
+        min_tokens=2,
+    ):
+        """
+        Generate one sentence per planning step.
+
+        Unlike the original implementation, each sentence is conditioned
+        on the representation of the previous sentence. This gives:
+
+            step 1 -> step 2 -> step 3 -> ...
+
+        language continuity.
+        """
+
         plan_sequence = tf.convert_to_tensor(
             plan_sequence,
             dtype=tf.float32,
@@ -1490,7 +1760,10 @@ class HierarchicalPlanDecoder(layers.Layer):
             training=False,
         )
 
-        b = tf.shape(plan_sequence)[0]
+        batch_size = tf.shape(
+            plan_sequence
+        )[0]
+
         depth = plan_sequence.shape[1]
 
         if depth is None:
@@ -1500,100 +1773,323 @@ class HierarchicalPlanDecoder(layers.Layer):
 
         all_steps = []
 
+        # --------------------------------------------------------
+        # Previous sentence semantic state.
+        # --------------------------------------------------------
+
+        previous_sentence_state = tf.zeros(
+            [
+                batch_size,
+                D_MODEL,
+            ],
+            dtype=tf.float32,
+        )
+
         for step_idx in range(depth):
 
-            context = contexts[:, step_idx, :]
+            plan_context = contexts[
+                :,
+                step_idx,
+                :,
+            ]
+
+            # ----------------------------------------------------
+            # Hierarchical sentence context.
+            # ----------------------------------------------------
+
+            previous_projected = (
+                self.previous_sentence_projection(
+                    previous_sentence_state
+                )
+            )
+
+            gate = self.previous_sentence_gate(
+                tf.concat(
+                    [
+                        plan_context,
+                        previous_projected,
+                    ],
+                    axis=-1,
+                )
+            )
+
+            previous_projected = (
+                previous_projected * gate
+            )
+
+            context = self.sentence_fusion(
+                tf.concat(
+                    [
+                        plan_context,
+                        previous_projected,
+                    ],
+                    axis=-1,
+                )
+            )
+
+            # ----------------------------------------------------
+            # Token generation.
+            # ----------------------------------------------------
 
             state = context
 
             current = tf.fill(
-                [b],
-                tf.cast(CLS_ID, tf.int32),
+                [batch_size],
+                tf.cast(
+                    CLS_ID,
+                    tf.int32,
+                ),
             )
 
             generated = []
-            finished = tf.zeros([b], dtype=tf.bool)
 
-            for t in range(max_length - 1):
+            finished = tf.zeros(
+                [batch_size],
+                dtype=tf.bool,
+            )
 
-                # EXACT SAME transformation used during training.
-                token_x = self._prepare_token_input(
-                    current[:, None],
-                    context,
-                )[:, 0, :]
+            for t in range(
+                max_length - 1
+            ):
 
-                output, states = self.token_gru_cell(
-                    token_x,
-                    [state],
-                    training=False,
+                token_x = (
+                    self._prepare_token_input(
+                        current[:, None],
+                        context,
+                    )[:, 0, :]
+                )
+
+                output, states = (
+                    self.token_gru_cell(
+                        token_x,
+                        [state],
+                        training=False,
+                    )
                 )
 
                 state = states[0]
 
                 logits = self.output_head(
-                    self.output_norm(output)
+                    self.output_norm(
+                        output
+                    )
                 )
 
-                logits = self._apply_generation_constraints(
-                    logits,
-                    generated,
-                    t,
+                logits = tf.identity(
+                    logits
                 )
 
-                next_token = sample_token(
-                    logits,
-                    temperature=0.55,
-                    top_k=15,
+                # ------------------------------------------------
+                # Never generate control tokens.
+                # ------------------------------------------------
+
+                for token_id in (
+                    PAD_ID,
+                    MASK_ID,
+                    CLS_ID,
+                ):
+                    ids = tf.fill(
+                        [batch_size],
+                        tf.cast(
+                            token_id,
+                            tf.int32,
+                        ),
+                    )
+
+                    indices = tf.stack(
+                        [
+                            tf.range(
+                                batch_size
+                            ),
+                            ids,
+                        ],
+                        axis=1,
+                    )
+
+                    logits = (
+                        tf.tensor_scatter_nd_update(
+                            logits,
+                            indices,
+                            tf.fill(
+                                [batch_size],
+                                tf.cast(
+                                    -1e9,
+                                    logits.dtype,
+                                ),
+                            ),
+                        )
+                    )
+
+                # ------------------------------------------------
+                # EOS.
+                # ------------------------------------------------
+
+                eos_ids = tf.fill(
+                    [batch_size],
+                    tf.cast(
+                        EOS_ID,
+                        tf.int32,
+                    ),
                 )
 
+                eos_indices = tf.stack(
+                    [
+                        tf.range(
+                            batch_size
+                        ),
+                        eos_ids,
+                    ],
+                    axis=1,
+                )
+
+                if t < min_tokens:
+                    logits = (
+                        tf.tensor_scatter_nd_update(
+                            logits,
+                            eos_indices,
+                            tf.fill(
+                                [batch_size],
+                                tf.cast(
+                                    -1e9,
+                                    logits.dtype,
+                                ),
+                            )
+                        )
+                    )
+                else:
+                    logits = (
+                        tf.tensor_scatter_nd_add(
+                            logits,
+                            eos_indices,
+                            tf.fill(
+                                [batch_size],
+                                tf.cast(
+                                    self.eos_bias,
+                                    logits.dtype,
+                                ),
+                            )
+                        )
+                    )
+
+                # ------------------------------------------------
+                # Repetition penalty.
+                # ------------------------------------------------
+
+                logits = (
+                    self._apply_repetition_penalty(
+                        logits,
+                        generated,
+                        penalty=REPETITION_PENALTY,
+                    )
+                )
+
+                # ------------------------------------------------
+                # Bigram blocking.
+                # ------------------------------------------------
+
+                if BIGRAM_BLOCKING:
+                    logits = (
+                        self._apply_bigram_blocking(
+                            logits,
+                            generated,
+                        )
+                    )
+
+                # ------------------------------------------------
+                # Decode.
+                # ------------------------------------------------
+
+                if greedy:
+                    next_token = tf.argmax(
+                        logits,
+                        axis=-1,
+                        output_type=tf.int32,
+                    )
+
+                else:
+                    next_token = sample_token(
+                        logits,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+
+                # Already-finished examples remain EOS.
                 next_token = tf.where(
                     finished,
                     tf.fill(
-                        [b],
-                        tf.cast(EOS_ID, tf.int32),
+                        [batch_size],
+                        tf.cast(
+                            EOS_ID,
+                            tf.int32,
+                        ),
                     ),
                     next_token,
                 )
 
-                generated.append(next_token)
+                generated.append(
+                    next_token
+                )
 
                 finished = tf.logical_or(
                     finished,
-                    tf.equal(next_token, EOS_ID),
+                    tf.equal(
+                        next_token,
+                        EOS_ID,
+                    ),
                 )
 
                 current = next_token
 
                 if bool(
-                    tf.reduce_all(finished).numpy()
+                    tf.reduce_all(
+                        finished
+                    ).numpy()
                 ):
                     break
 
-            if len(generated) < max_length - 1:
-                generated.extend(
-                    [
-                        tf.fill(
-                            [b],
-                            tf.cast(EOS_ID, tf.int32),
-                        )
-                        for _ in range(
-                            max_length - 1 - len(generated)
-                        )
-                    ]
+            # ----------------------------------------------------
+            # Pad the generated sequence.
+            # ----------------------------------------------------
+
+            while len(generated) < max_length - 1:
+                generated.append(
+                    tf.fill(
+                        [batch_size],
+                        tf.cast(
+                            EOS_ID,
+                            tf.int32,
+                        ),
+                    )
                 )
 
-            all_steps.append(
-                tf.stack(
-                    generated[:max_length - 1],
-                    axis=1,
-                )
+            generated_tensor = tf.stack(
+                generated[
+                    :max_length - 1
+                ],
+                axis=1,
             )
+
+            all_steps.append(
+                generated_tensor
+            )
+
+            # ----------------------------------------------------
+            # IMPORTANT:
+            #
+            # Feed a semantic representation of the generated
+            # sentence into the next sentence.
+            #
+            # We use the final GRU state rather than averaging tokens,
+            # because it contains the autoregressive sentence history.
+            # ----------------------------------------------------
+
+            previous_sentence_state = state
 
         return tf.stack(
             all_steps,
             axis=1,
         )
-
 # ============================================================
 # TOKEN UTILITIES
 # ============================================================
@@ -1873,9 +2369,34 @@ class BellmanLatentPlanner(tf.keras.Model):
             "termination_targets": inputs["termination_targets"],
         }
 
-    def generate_plan(self, state_ids, goal_ids, depth):
-        state = self.encode(state_ids, training=False)["state"]
-        goal = self.encode(goal_ids, training=False)["state"]
+    def generate_plan(
+        self,
+        state_ids,
+        goal_ids,
+        depth,
+        greedy=False,
+        temperature=0.60,
+        top_k=40,
+        top_p=0.92,
+    ):
+        """
+        Autoregressively generate a latent plan from state -> goal.
+        """
+
+        state = self.encode(
+            state_ids,
+            training=False,
+        )["state"]
+
+        goal = self.encode(
+            goal_ids,
+            training=False,
+        )["state"]
+
+        # --------------------------------------------------------
+        # Recursive latent planning
+        # --------------------------------------------------------
+
         recursive = self.planner.plan(
             state=state,
             goal=goal,
@@ -1884,19 +2405,57 @@ class BellmanLatentPlanner(tf.keras.Model):
             observed_next_states=None,
             training=False,
         )
-        sentence_plan = self.plan_sentence_projection(recursive["plan"])
-        generated_ids = self.decoder.generate(sentence_plan, max_length=MAX_SEQ_LEN)
+
+        # --------------------------------------------------------
+        # Convert plan + action representations into decoder space
+        # --------------------------------------------------------
+
+        plan_sentence = self.plan_sentence_projection(
+            recursive["plan"]
+        )
+
+        recursive_action_plan = self.action_plan_projection(
+            recursive["actions"]
+        )
+
+        sentence_plan = self.sentence_fusion(
+            tf.concat(
+                [
+                    plan_sentence,
+                    recursive_action_plan,
+                ],
+                axis=-1,
+            )
+        )
+
+        sentence_plan = tf.math.l2_normalize(
+            sentence_plan,
+            axis=-1,
+        )
+
+        # --------------------------------------------------------
+        # Generate language for every planning step
+        # --------------------------------------------------------
+
+        generated_ids = self.decoder.generate(
+            sentence_plan,
+            max_length=MAX_SEQ_LEN,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            greedy=greedy,
+            min_tokens=MIN_GENERATION_TOKENS,
+        )
+
         return {
             "generated_ids": generated_ids,
-            "plan_embeddings": recursive["plan"],
-            "sentence_embeddings": sentence_plan,
-            "predicted_states": recursive["states"],
             "actions": recursive["actions"],
             "q_values": recursive["q_values"],
+            "predicted_states": recursive["next_states"],
+            "termination_logits": recursive["termination_logits"],
             "final_state": recursive["final_state"],
             "goal": goal,
         }
-
 
 # ============================================================
 # LOSSES
@@ -2372,20 +2931,57 @@ def train_from_file(data_path, epochs, batch_size, depth):
 # ============================================================
 # GENERATION / DIAGNOSTICS
 # ============================================================
-def generate_plan(model, vectorizer, state_text, goal_text, depth):
-    state_ids = encode_texts([state_text], vectorizer)
-    goal_ids = encode_texts([goal_text], vectorizer)
-    output = model.generate_plan(state_ids, goal_ids, depth)
+def generate_plan(
+    model,
+    vectorizer,
+    state_text,
+    goal_text,
+    depth,
+    greedy=False,
+    temperature=0.60,
+):
+    state_ids = encode_texts(
+        [state_text],
+        vectorizer,
+    )
+
+    goal_ids = encode_texts(
+        [goal_text],
+        vectorizer,
+    )
+
+    output = model.generate_plan(
+        state_ids,
+        goal_ids,
+        depth,
+        greedy=greedy,
+        temperature=temperature,
+        top_k=40,
+        top_p=0.92,
+    )
+
     generated_ids = output["generated_ids"][0]
+
     sentences = []
+
     for step in generated_ids:
-        sentence = ids_to_text(step.numpy(), vectorizer)
-        sentences.append(sentence if sentence else "[empty decoded step]")
+        sentence = ids_to_text(
+            step.numpy(),
+            vectorizer,
+        )
+
+        sentences.append(
+            sentence
+            if sentence
+            else "[empty decoded step]"
+        )
+
     return {
         "sentences": sentences,
         "actions": output["actions"][0].numpy(),
         "q_values": output["q_values"][0].numpy(),
         "predicted_states": output["predicted_states"][0].numpy(),
+        "termination_logits": output["termination_logits"][0].numpy(),
         "final_state": output["final_state"][0].numpy(),
         "goal": output["goal"][0].numpy(),
     }
@@ -2428,6 +3024,18 @@ def parse_args():
     parser.add_argument("--weights", default="bellman_planner.weights.h5")
     parser.add_argument("--vocabulary", default="bellman_planner.vocab.txt")
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Use deterministic greedy decoding.",
+    )
+
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.60,
+        help="Sampling temperature.",
+    )
     return parser.parse_args()
 
 
@@ -2457,7 +3065,15 @@ def main():
         save_planner(model, args.weights)
         save_vocabulary(vectorizer, args.vocabulary)
         print(f"Saved vocabulary: {args.vocabulary}")
-        result = generate_plan(model, vectorizer, args.state, args.goal, args.depth)
+        result = generate_plan(
+            model,
+            vectorizer,
+            args.state,
+            args.goal,
+            args.depth,
+            greedy=args.greedy,
+            temperature=args.temperature,
+        )
 
     print("\n" + "=" * 70)
     print("PLANNING QUERY")
@@ -2483,3 +3099,26 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+For evaluation, I recommend:
+
+python planner.py \
+    --data data.txt \
+    --epochs 150 \
+    --depth 4 \
+    --state "The bedroom is cold." \
+    --goal "The bedroom is warm." \
+    --greedy
+
+For more varied plans:
+
+python planner.py \
+    --data data.txt \
+    --epochs 150 \
+    --depth 4 \
+    --state "The bedroom is cold." \
+    --goal "The bedroom is warm." \
+    --temperature 0.65
+
+"""
