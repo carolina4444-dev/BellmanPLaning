@@ -74,6 +74,7 @@ W_RECURSIVE_ACTION = 1.25
 W_PLAN_ALIGNMENT = 1.50
 W_PLAN_LANGUAGE_ALIGNMENT = 2.0
 W_TERMINATION = 1.0
+W_DECODER_GROUNDING = 1.25
 
 LABEL_SMOOTHING = 0.04
 REPETITION_PENALTY = 1.0
@@ -2090,6 +2091,1113 @@ class HierarchicalPlanDecoder(layers.Layer):
             all_steps,
             axis=1,
         )
+
+
+################################################################################
+
+# ============================================================
+# GROUNDED HIERARCHICAL DECODER
+# ============================================================
+
+class GroundedHierarchicalPlanDecoder(layers.Layer):
+    """
+    Grounded hierarchical autoregressive decoder.
+
+    Every planning step has an explicit grounding record:
+
+        S_t
+        A_t
+        predicted S_{t+1}
+        G
+        reward_t
+        Q_t
+        plan_t
+
+    The decoder creates several grounding tokens from these quantities
+    and uses cross-attention at EVERY generated language token.
+
+    This is substantially stronger than passing a single fused plan vector.
+
+    Training:
+
+        grounding_t + teacher-forced tokens -> target sentence
+
+    Inference:
+
+        grounding_t + autoregressive tokens -> generated sentence
+
+    Sentence t also receives a semantic summary of sentence t-1, giving
+    hierarchical continuity without allowing previous language to replace
+    the actual state/action grounding.
+    """
+
+    def __init__(self, vocab_size, max_depth):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.max_depth = max_depth
+
+        # --------------------------------------------------------
+        # Step / temporal embeddings
+        # --------------------------------------------------------
+
+        self.step_embedding = layers.Embedding(
+            max_depth,
+            D_MODEL,
+        )
+
+        # --------------------------------------------------------
+        # Individual grounding projections
+        # --------------------------------------------------------
+
+        self.state_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        self.action_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        self.next_state_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        self.goal_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        self.plan_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        self.reward_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        self.q_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        # --------------------------------------------------------
+        # Grounding token type embeddings
+        #
+        # These tell attention whether a vector represents state,
+        # action, goal, etc.
+        # --------------------------------------------------------
+
+        self.grounding_type_embedding = layers.Embedding(
+            7,
+            D_MODEL,
+        )
+
+        self.grounding_norm = layers.LayerNormalization()
+
+        # --------------------------------------------------------
+        # Grounding attention
+        # --------------------------------------------------------
+
+        self.grounding_attention = layers.MultiHeadAttention(
+            num_heads=6,
+            key_dim=D_MODEL // 6,
+            dropout=0.10,
+        )
+
+        self.grounding_attention_norm = layers.LayerNormalization()
+
+        self.grounding_ffn = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+        ])
+
+        self.grounding_ffn_norm = layers.LayerNormalization()
+
+        # --------------------------------------------------------
+        # Sentence-level hierarchy
+        # --------------------------------------------------------
+
+        self.sentence_gru = layers.GRU(
+            D_MODEL,
+            return_sequences=True,
+        )
+
+        self.previous_sentence_projection = layers.Dense(
+            D_MODEL,
+            activation="gelu",
+        )
+
+        self.previous_sentence_gate = layers.Dense(
+            D_MODEL,
+            activation="sigmoid",
+        )
+
+        self.sentence_fusion = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
+
+        # --------------------------------------------------------
+        # Token embedding
+        # --------------------------------------------------------
+
+        self.token_embedding = layers.Embedding(
+            vocab_size,
+            D_MODEL,
+        )
+
+        self.token_fusion = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
+
+        # --------------------------------------------------------
+        # Token GRU
+        # --------------------------------------------------------
+
+        self.token_gru_cell = layers.GRUCell(
+            D_MODEL,
+        )
+
+        self.output_norm = layers.LayerNormalization()
+
+        self.output_head = layers.Dense(
+            vocab_size,
+        )
+
+        # --------------------------------------------------------
+        # Learned grounding gate
+        #
+        # Prevents the language model from completely ignoring the
+        # physical/latent transition representation.
+        # --------------------------------------------------------
+
+        self.grounding_gate = layers.Dense(
+            D_MODEL,
+            activation="sigmoid",
+        )
+
+        # --------------------------------------------------------
+        # EOS
+        # --------------------------------------------------------
+
+        self.eos_bias = self.add_weight(
+            name="grounded_eos_bias",
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.25),
+            trainable=True,
+        )
+
+        self.sentence_grounding_head = tf.keras.Sequential([
+            layers.Dense(
+                2 * D_MODEL,
+                activation="gelu",
+            ),
+            layers.Dense(D_MODEL),
+            layers.LayerNormalization(),
+        ])
+
+    # ============================================================
+    # GROUNDING REPRESENTATION
+    # ============================================================
+
+    def build_grounding_tokens(
+        self,
+        states,
+        actions,
+        next_states,
+        goal,
+        rewards,
+        q_values,
+        plan,
+    ):
+        """
+        Construct explicit grounding tokens.
+
+        Inputs:
+
+            states       [B,T,D_MODEL]
+            actions      [B,T,D_ACTION]
+            next_states  [B,T,D_MODEL]
+            goal         [B,D_MODEL]
+            rewards      [B,T]
+            q_values     [B,T]
+            plan         [B,T,D_PLAN]
+
+        Returns:
+
+            grounding_tokens [B,T,7,D_MODEL]
+        """
+
+        b = tf.shape(states)[0]
+        t = tf.shape(states)[1]
+
+        # --------------------------------------------------------
+        # Broadcast goal over planning steps.
+        # --------------------------------------------------------
+
+        goal = tf.broadcast_to(
+            goal[:, None, :],
+            [b, t, D_MODEL],
+        )
+
+        # --------------------------------------------------------
+        # Individual semantic projections.
+        # --------------------------------------------------------
+
+        state_x = self.state_projection(states)
+
+        action_x = self.action_projection(actions)
+
+        next_state_x = self.next_state_projection(
+            next_states
+        )
+
+        goal_x = self.goal_projection(
+            goal
+        )
+
+        reward_x = self.reward_projection(
+            rewards[..., None]
+        )
+
+        q_x = self.q_projection(
+            q_values[..., None]
+        )
+
+        plan_x = self.plan_projection(
+            plan
+        )
+
+        tokens = tf.stack(
+            [
+                state_x,
+                action_x,
+                next_state_x,
+                goal_x,
+                reward_x,
+                q_x,
+                plan_x,
+            ],
+            axis=2,
+        )
+
+        # --------------------------------------------------------
+        # Add token-type information.
+        # --------------------------------------------------------
+
+        type_ids = tf.range(
+            7,
+            dtype=tf.int32,
+        )
+
+        type_x = self.grounding_type_embedding(
+            type_ids
+        )
+
+        type_x = type_x[None, None, :, :]
+
+        tokens = tokens + type_x
+
+        return self.grounding_norm(tokens)
+
+
+
+    def sentence_grounding_embedding(
+        self,
+        grounding_tokens,
+    ):
+        """
+        Produce one representation per grounded planning step.
+
+        [B,T,7,D] -> [B,T,D]
+        """
+
+        x = tf.reduce_mean(
+            grounding_tokens,
+            axis=2,
+        )
+
+        return tf.math.l2_normalize(
+            self.sentence_grounding_head(x),
+            axis=-1,
+        )
+    # ============================================================
+    # GROUNDING SELF-ORGANIZATION
+    # ============================================================
+
+    def process_grounding(
+        self,
+        grounding_tokens,
+        training=False,
+    ):
+        """
+        Let the seven grounding components interact before the
+        token decoder consumes them.
+        """
+
+        b = tf.shape(grounding_tokens)[0]
+        t = tf.shape(grounding_tokens)[1]
+
+        flat = tf.reshape(
+            grounding_tokens,
+            [
+                b * t,
+                7,
+                D_MODEL,
+            ],
+        )
+
+        attended = self.grounding_attention(
+            query=flat,
+            value=flat,
+            key=flat,
+            training=training,
+        )
+
+        flat = self.grounding_attention_norm(
+            flat + attended
+        )
+
+        ff = self.grounding_ffn(
+            flat,
+            training=training,
+        )
+
+        flat = self.grounding_ffn_norm(
+            flat + ff
+        )
+
+        return tf.reshape(
+            flat,
+            [
+                b,
+                t,
+                7,
+                D_MODEL,
+            ],
+        )
+
+    # ============================================================
+    # SENTENCE CONTEXT
+    # ============================================================
+
+    def compute_sentence_contexts(
+        self,
+        grounding_tokens,
+        plan_sequence,
+        training=False,
+    ):
+        """
+        Produce one high-level context per planning step.
+
+        The sentence context is obtained from the entire grounding
+        tuple, not merely from the plan embedding.
+        """
+
+        # Mean over the seven grounding channels.
+        grounding_summary = tf.reduce_mean(
+            grounding_tokens,
+            axis=2,
+        )
+
+        step_count = tf.shape(plan_sequence)[1]
+
+        positions = tf.range(
+            step_count
+        )
+
+        step_x = self.step_embedding(
+            positions
+        )[None, :, :]
+
+        x = grounding_summary + step_x
+
+        x = self.sentence_gru(
+            x,
+            training=training,
+        )
+
+        return self.sentence_fusion(
+            tf.concat(
+                [
+                    x,
+                    plan_sequence,
+                ],
+                axis=-1,
+            )
+        )
+
+    # ============================================================
+    # TOKEN + GROUNDING ATTENTION
+    # ============================================================
+
+    def decode_token(
+        self,
+        token_ids,
+        token_state,
+        sentence_context,
+        grounding_tokens,
+        training=False,
+    ):
+        """
+        Decode one token.
+        """
+
+        # GRUCell state is always [batch, hidden].
+        if token_state.shape.rank == 3:
+            token_state = tf.squeeze(token_state, axis=1)
+
+        token_x = self.token_embedding(token_ids)
+
+        token_x = self.token_fusion(
+            tf.concat(
+                [
+                    token_x,
+                    tf.squeeze(sentence_context, axis=1),
+                ],
+                axis=-1,
+            )
+        )
+
+        # --------------------------------------------------------
+        # Cross-attend token state to grounded transition.
+        # --------------------------------------------------------
+
+        query = tf.expand_dims(token_state, axis=1)
+
+        attended = self.grounding_attention(
+            query=query,
+            key=grounding_tokens,
+            value=grounding_tokens,
+            training=training,
+        )
+
+        attended = attended[:, 0, :]
+
+        # --------------------------------------------------------
+        # Learned grounding gate.
+        # --------------------------------------------------------
+
+        gate = self.grounding_gate(
+            tf.concat(
+                [
+                    token_x,
+                    attended,
+                ],
+                axis=-1,
+            )
+        )
+
+        grounded = attended * gate
+
+        # --------------------------------------------------------
+        # Token input.
+        # --------------------------------------------------------
+
+        x = token_x + grounded
+
+        output, states = self.token_gru_cell(
+            x,
+            [token_state],
+            training=training,
+        )
+
+        return output, states[0]
+    # ============================================================
+    # TEACHER FORCING
+    # ============================================================
+
+    def teacher_force(
+        self,
+        plan_sequence,
+        grounding_tokens,
+        decoder_input_ids,
+        training=False,
+    ):
+        """
+        decoder_input_ids:
+
+            [B,T,L]
+
+        Returns:
+
+            [B,T,L,vocab]
+        """
+
+        b = tf.shape(plan_sequence)[0]
+        depth = tf.shape(plan_sequence)[1]
+        length = tf.shape(decoder_input_ids)[2]
+
+        sentence_contexts = self.compute_sentence_contexts(
+            grounding_tokens,
+            plan_sequence,
+            training=training,
+        )
+
+        outputs = []
+
+        # Previous sentence state is maintained across planning steps.
+        previous_sentence_state = tf.zeros(
+            [b, D_MODEL],
+            dtype=tf.float32,
+        )
+
+        for step in range(self.max_depth):
+
+            # ----------------------------------------------------
+            # Current sentence grounding.
+            # ----------------------------------------------------
+
+            current_grounding = grounding_tokens[
+                :,
+                step,
+                :,
+                :
+            ]
+
+            current_sentence_context = sentence_contexts[
+                :,
+                step,
+                :
+            ]
+
+            # ----------------------------------------------------
+            # Hierarchical previous-sentence conditioning.
+            # ----------------------------------------------------
+
+            previous_x = self.previous_sentence_projection(
+                previous_sentence_state
+            )
+
+            gate = self.previous_sentence_gate(
+                tf.concat(
+                    [
+                        current_sentence_context,
+                        previous_x,
+                    ],
+                    axis=-1,
+                )
+            )
+
+            previous_x = previous_x * gate
+
+            if current_sentence_context.shape.rank == 2:
+                current_sentence_context = tf.expand_dims(
+                    current_sentence_context, axis=1
+                )
+
+            if previous_x.shape.rank == 2:
+                previous_x = tf.expand_dims(
+                    previous_x, axis=1
+                )
+
+            current_sentence_context = self.sentence_fusion(
+                tf.concat(
+                    [
+                        current_sentence_context,
+                        previous_x,
+                    ],
+                    axis=-1,
+                )
+            )
+
+            # ----------------------------------------------------
+            # Token decoding.
+            # ----------------------------------------------------
+
+            state = current_sentence_context
+
+            step_ids = decoder_input_ids[
+                :,
+                step,
+                :
+            ]
+
+            sentence_outputs = []
+
+            for token_idx in range(MAX_SEQ_LEN - 1):
+
+                token_ids = step_ids[
+                    :,
+                    token_idx
+                ]
+
+                output, state = self.decode_token(
+                    token_ids,
+                    state,
+                    current_sentence_context,
+                    current_grounding,
+                    training=training,
+                )
+
+                sentence_outputs.append(
+                    output
+                )
+
+            sentence_outputs = tf.stack(
+                sentence_outputs,
+                axis=1,
+            )
+
+            sentence_outputs = self.output_norm(
+                sentence_outputs
+            )
+
+            logits = self.output_head(
+                sentence_outputs
+            )
+
+            outputs.append(logits)
+
+            # The final autoregressive hidden state becomes the
+            # previous sentence representation.
+            previous_sentence_state = state
+
+        return tf.stack(
+            outputs,
+            axis=1,
+        )
+
+    # ============================================================
+    # TRAINING CALL
+    # ============================================================
+
+    def call(
+        self,
+        plan_sequence,
+        grounding,
+        decoder_input_ids,
+        training=False,
+    ):
+        """
+        grounding is a dictionary containing:
+
+            state
+            action
+            next_state
+            goal
+            reward
+            q_value
+            plan
+        """
+
+        grounding_tokens = self.build_grounding_tokens(
+            states=grounding["state"],
+            actions=grounding["action"],
+            next_states=grounding["next_state"],
+            goal=grounding["goal"],
+            rewards=grounding["reward"],
+            q_values=grounding["q_value"],
+            plan=grounding["plan"],
+        )
+
+        grounding_tokens = self.process_grounding(
+            grounding_tokens,
+            training=training,
+        )
+
+        return self.teacher_force(
+            plan_sequence=plan_sequence,
+            grounding_tokens=grounding_tokens,
+            decoder_input_ids=decoder_input_ids,
+            training=training,
+        )
+
+    # ============================================================
+    # GENERATION
+    # ============================================================
+
+    def generate(
+        self,
+        plan_sequence,
+        grounding,
+        max_length=MAX_SEQ_LEN,
+        temperature=0.60,
+        top_k=40,
+        top_p=0.92,
+        greedy=False,
+        min_tokens=2,
+    ):
+        """
+        Grounded autoregressive generation.
+
+        Every token generated at step t can attend to:
+
+            S_t
+            A_t
+            S_{t+1}
+            G
+            R_t
+            Q_t
+            P_t
+        """
+
+        grounding_tokens = self.build_grounding_tokens(
+            states=grounding["state"],
+            actions=grounding["action"],
+            next_states=grounding["next_state"],
+            goal=grounding["goal"],
+            rewards=grounding["reward"],
+            q_values=grounding["q_value"],
+            plan=grounding["plan"],
+        )
+
+        grounding_tokens = self.process_grounding(
+            grounding_tokens,
+            training=False,
+        )
+
+        contexts = self.compute_sentence_contexts(
+            grounding_tokens,
+            plan_sequence,
+            training=False,
+        )
+
+        batch_size = tf.shape(
+            plan_sequence
+        )[0]
+
+        depth = plan_sequence.shape[1]
+
+        if depth is None:
+            depth = int(
+                tf.shape(plan_sequence)[1].numpy()
+            )
+
+        all_steps = []
+
+        previous_sentence_state = tf.zeros(
+            [batch_size, D_MODEL],
+            dtype=tf.float32,
+        )
+
+        for step in range(depth):
+
+            current_grounding = grounding_tokens[
+                :,
+                step,
+                :,
+                :
+            ]
+
+            current_context = contexts[
+                :,
+                step,
+                :
+            ]
+
+            # ----------------------------------------------------
+            # Previous sentence conditioning
+            # ----------------------------------------------------
+
+            previous_x = self.previous_sentence_projection(
+                previous_sentence_state
+            )
+
+            gate = self.previous_sentence_gate(
+                tf.concat(
+                    [
+                        current_context,
+                        previous_x,
+                    ],
+                    axis=-1,
+                )
+            )
+
+            previous_x = previous_x * gate
+
+            current_context = self.sentence_fusion(
+                tf.concat(
+                    [
+                        current_context,
+                        previous_x,
+                    ],
+                    axis=-1,
+                )
+            )
+
+            # ----------------------------------------------------
+            # Autoregressive token generation
+            # ----------------------------------------------------
+
+            state = current_context
+
+            current = tf.fill(
+                [batch_size],
+                tf.cast(CLS_ID, tf.int32),
+            )
+
+            generated = []
+
+            finished = tf.zeros(
+                [batch_size],
+                dtype=tf.bool,
+            )
+
+            for token_idx in range(max_length - 1):
+
+                output, state = self.decode_token(
+                    current,
+                    state,
+                    current_context,
+                    current_grounding,
+                    training=False,
+                )
+
+                logits = self.output_head(
+                    self.output_norm(output)
+                )
+
+                logits = tf.identity(logits)
+
+                # ------------------------------------------------
+                # Never emit PAD/MASK/CLS.
+                # ------------------------------------------------
+
+                for token_id in (
+                    PAD_ID,
+                    MASK_ID,
+                    CLS_ID,
+                ):
+                    ids = tf.fill(
+                        [batch_size],
+                        tf.cast(token_id, tf.int32),
+                    )
+
+                    indices = tf.stack(
+                        [
+                            tf.range(batch_size),
+                            ids,
+                        ],
+                        axis=1,
+                    )
+
+                    logits = tf.tensor_scatter_nd_update(
+                        logits,
+                        indices,
+                        tf.fill(
+                            [batch_size],
+                            tf.cast(
+                                -1e9,
+                                logits.dtype,
+                            ),
+                        ),
+                    )
+
+                # ------------------------------------------------
+                # EOS control
+                # ------------------------------------------------
+
+                eos_ids = tf.fill(
+                    [batch_size],
+                    tf.cast(EOS_ID, tf.int32),
+                )
+
+                eos_indices = tf.stack(
+                    [
+                        tf.range(batch_size),
+                        eos_ids,
+                    ],
+                    axis=1,
+                )
+
+                if token_idx < min_tokens:
+
+                    logits = tf.tensor_scatter_nd_update(
+                        logits,
+                        eos_indices,
+                        tf.fill(
+                            [batch_size],
+                            tf.cast(
+                                -1e9,
+                                logits.dtype,
+                            ),
+                        ),
+                    )
+
+                else:
+
+                    logits = tf.tensor_scatter_nd_add(
+                        logits,
+                        eos_indices,
+                        tf.fill(
+                            [batch_size],
+                            tf.cast(
+                                self.eos_bias,
+                                logits.dtype,
+                            ),
+                        ),
+                    )
+
+                # ------------------------------------------------
+                # Repetition penalty
+                # ------------------------------------------------
+
+                if generated:
+
+                    history = tf.stack(
+                        generated,
+                        axis=1,
+                    )
+
+                    one_hot = tf.one_hot(
+                        history,
+                        self.vocab_size,
+                    )
+
+                    seen = tf.reduce_max(
+                        one_hot,
+                        axis=1,
+                    )
+
+                    logits -= (
+                        seen * REPETITION_PENALTY
+                    )
+
+                # ------------------------------------------------
+                # Bigram blocking
+                # ------------------------------------------------
+
+                if BIGRAM_BLOCKING and len(generated) >= 2:
+
+                    sequences = tf.stack(
+                        generated,
+                        axis=1,
+                    ).numpy()
+
+                    masks = np.zeros(
+                        [
+                            int(batch_size.numpy()),
+                            self.vocab_size,
+                        ],
+                        dtype=np.float32,
+                    )
+
+                    for b_idx in range(
+                        sequences.shape[0]
+                    ):
+                        seq = sequences[b_idx].tolist()
+                        previous = seq[-1]
+
+                        forbidden = set()
+
+                        for j in range(
+                            len(seq) - 1
+                        ):
+                            if seq[j] == previous:
+                                forbidden.add(
+                                    seq[j + 1]
+                                )
+
+                        for token_id in forbidden:
+                            if 0 <= token_id < self.vocab_size:
+                                masks[
+                                    b_idx,
+                                    token_id,
+                                ] = 1.0
+
+                    logits -= (
+                        tf.convert_to_tensor(
+                            masks,
+                            dtype=logits.dtype,
+                        )
+                        * 1e9
+                    )
+
+                # ------------------------------------------------
+                # Decode
+                # ------------------------------------------------
+
+                if greedy:
+
+                    next_token = tf.argmax(
+                        logits,
+                        axis=-1,
+                        output_type=tf.int32,
+                    )
+
+                else:
+
+                    next_token = sample_token(
+                        logits,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+
+                # Already-finished rows stay EOS.
+                next_token = tf.where(
+                    finished,
+                    tf.fill(
+                        [batch_size],
+                        tf.cast(
+                            EOS_ID,
+                            tf.int32,
+                        ),
+                    ),
+                    next_token,
+                )
+
+                generated.append(
+                    next_token
+                )
+
+                finished = tf.logical_or(
+                    finished,
+                    tf.equal(
+                        next_token,
+                        EOS_ID,
+                    ),
+                )
+
+                current = next_token
+
+                if bool(
+                    tf.reduce_all(
+                        finished
+                    ).numpy()
+                ):
+                    break
+
+            while len(generated) < max_length - 1:
+                generated.append(
+                    tf.fill(
+                        [batch_size],
+                        tf.cast(EOS_ID, tf.int32),
+                    )
+                )
+
+            all_steps.append(
+                tf.stack(
+                    generated[:max_length - 1],
+                    axis=1,
+                )
+            )
+
+            previous_sentence_state = state
+
+        return tf.stack(
+            all_steps,
+            axis=1,
+        )
+
 # ============================================================
 # TOKEN UTILITIES
 # ============================================================
@@ -2206,7 +3314,11 @@ class BellmanLatentPlanner(tf.keras.Model):
             layers.LayerNormalization(),
         ])
 
-        self.decoder = HierarchicalPlanDecoder(vocab_size, depth)
+        # self.decoder = HierarchicalPlanDecoder(vocab_size, depth)
+        self.decoder = GroundedHierarchicalPlanDecoder(
+            vocab_size,
+            depth,
+        )
         self.planner = RecursiveBellmanPlanner(
             self.action_model,
             self.transition_model,
@@ -2328,9 +3440,42 @@ class BellmanLatentPlanner(tf.keras.Model):
         decoder_inputs = decoder_full[:, :, :-1]
         decoder_targets = decoder_full[:, :, 1:]
 
+        # decoder_logits = self.decoder(
+        #     sentence_plan,
+        #     decoder_inputs,
+        #     training=training,
+        # )
+        # ============================================================
+        # EXPLICIT DECODER GROUNDING
+        # ============================================================
+
+        decoder_grounding = {
+            # Recursive state at planning step t.
+            "state": recursive["states"],
+
+            # Selected latent action A_t.
+            "action": recursive["actions"],
+
+            # Model-predicted next state S_{t+1}.
+            "next_state": recursive["next_states"],
+
+            # Global goal G.
+            "goal": goal,
+
+            # Intrinsic/goal-directed reward.
+            "reward": recursive["rewards"],
+
+            # Bellman Q estimate.
+            "q_value": recursive["q_values"],
+
+            # Explicit plan representation.
+            "plan": recursive["plan"],
+        }
+
         decoder_logits = self.decoder(
-            sentence_plan,
-            decoder_inputs,
+            plan_sequence=sentence_plan,
+            grounding=decoder_grounding,
+            decoder_input_ids=decoder_inputs,
             training=training,
         )
 
@@ -2367,6 +3512,8 @@ class BellmanLatentPlanner(tf.keras.Model):
 
             "termination_logits": recursive["termination_logits"],
             "termination_targets": inputs["termination_targets"],
+
+            "decoder_grounding": decoder_grounding,
         }
 
     def generate_plan(
@@ -2437,8 +3584,37 @@ class BellmanLatentPlanner(tf.keras.Model):
         # Generate language for every planning step
         # --------------------------------------------------------
 
+        # generated_ids = self.decoder.generate(
+        #     sentence_plan,
+        #     max_length=MAX_SEQ_LEN,
+        #     temperature=temperature,
+        #     top_k=top_k,
+        #     top_p=top_p,
+        #     greedy=greedy,
+        #     min_tokens=MIN_GENERATION_TOKENS,
+        # )
+
+        # --------------------------------------------------------
+        # EXPLICIT GENERATION GROUNDING
+        # --------------------------------------------------------
+
+        decoder_grounding = {
+            "state": recursive["states"],
+            "action": recursive["actions"],
+            "next_state": recursive["next_states"],
+            "goal": goal,
+            "reward": recursive["rewards"],
+            "q_value": recursive["q_values"],
+            "plan": recursive["plan"],
+        }
+
+        # --------------------------------------------------------
+        # Grounded language generation
+        # --------------------------------------------------------
+
         generated_ids = self.decoder.generate(
-            sentence_plan,
+            plan_sequence=sentence_plan,
+            grounding=decoder_grounding,
             max_length=MAX_SEQ_LEN,
             temperature=temperature,
             top_k=top_k,
@@ -2446,16 +3622,6 @@ class BellmanLatentPlanner(tf.keras.Model):
             greedy=greedy,
             min_tokens=MIN_GENERATION_TOKENS,
         )
-
-        return {
-            "generated_ids": generated_ids,
-            "actions": recursive["actions"],
-            "q_values": recursive["q_values"],
-            "predicted_states": recursive["next_states"],
-            "termination_logits": recursive["termination_logits"],
-            "final_state": recursive["final_state"],
-            "goal": goal,
-        }
 
 # ============================================================
 # LOSSES
@@ -2725,6 +3891,22 @@ def termination_loss(logits, targets, step_mask):
 
     return masked_mean(loss, step_mask)
 
+
+def decoder_grounding_alignment_loss(
+    decoder_grounding,
+    observed_plan,
+    step_mask,
+):
+    similarity = cosine_similarity(
+        decoder_grounding,
+        tf.stop_gradient(observed_plan),
+    )
+
+    return masked_mean(
+        1.0 - similarity,
+        step_mask,
+    )
+
 def compute_total_loss(outputs, transition_model):
     l_termination = termination_loss(
         outputs["recursive_plan"]["termination_logits"],
@@ -2791,6 +3973,12 @@ def compute_total_loss(outputs, transition_model):
         outputs["step_mask"],
     )
 
+    l_decoder_grounding = decoder_grounding_alignment_loss(
+        outputs["decoder_grounding"]["plan"],
+        outputs["observed_plan"],
+        outputs["step_mask"],
+    )
+
     total = (
         W_TRANSITION * l_transition
         + W_RECURSIVE_STATE * l_recursive_state
@@ -2810,6 +3998,7 @@ def compute_total_loss(outputs, transition_model):
         + W_PLAN_ALIGNMENT * l_plan_alignment
         + W_PLAN_LANGUAGE_ALIGNMENT * l_text_alignment_loss
         + W_TERMINATION * l_termination
+        + W_DECODER_GROUNDING * l_decoder_grounding
     )
 
     return total, {
