@@ -33,7 +33,6 @@ WEIGHT_DECAY = 1e-5
 GRAD_CLIP_NORM = 1.0
 GAMMA = 0.97
 CONTRASTIVE_TEMPERATURE = 0.12
-PLANNER_TEMPERATURE = 0.18
 PAD_ID = 0
 MASK_ID = 1
 CLS_ID = 2
@@ -50,10 +49,6 @@ W_CANDIDATE_DIVERSITY = 0.25
 W_RECURSIVE_STATE = 1.75
 W_TERMINATION = 1.0
 
-# Add under the CONFIG & HYPERPARAMETERS section (~line 40)
-REPETITION_PENALTY = 1.2
-BIGRAM_BLOCKING = True
-
 # Reproducibility
 tf.keras.utils.set_random_seed(SEED)
 np.random.seed(SEED)
@@ -67,68 +62,72 @@ def normalize_segment(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
 
 
-def segment_text(text: str) -> List[str]:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = []
-    for line in text.split("\n"):
-        line = normalize_segment(line)
-        if not line or re.fullmatch(r"[-*_]{3,}", line):
-            continue
-        parts = re.split(r"\s*(?:→|->)\s*", line)
-        lines.extend(parts)
-    out = []
-    for piece in lines:
-        piece = normalize_segment(piece)
-        if len(piece) >= 2:
-            out.append(piece)
-    return out
-
-
-def read_trajectories(path: str) -> List[List[str]]:
+def read_data_lines(path: str) -> List[str]:
+    """Canonical loader for line-based corpus."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Could not find corpus: {path}")
+
     with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-    if not text.strip():
+        lines = [normalize_segment(line) for line in f if normalize_segment(line)]
+
+    if not lines:
         raise ValueError(f"Corpus is empty: {path}")
 
-    blocks = re.split(r"\n\s*\n+", text.strip())
+    return lines
+
+
+def read_trajectories_from_lines(all_data_lines: List[str]):
+    """
+    Builds trajectories directly referencing indices in all_data_lines.
+    Ensures 1:1 mapping between global line target IDs and candidates.
+    """
+    line_to_id = {line: idx for idx, line in enumerate(all_data_lines)}
     trajectories = []
-    for block in blocks:
-        segments = segment_text(block)
-        if len(segments) >= 2:
-            trajectories.append(segments[:MAX_SEGMENTS_PER_TRAJECTORY])
+    
+    current_traj = []
+    current_rows = []
+
+    for line in all_data_lines:
+        if re.fullmatch(r"[-*_]{3,}", line):
+            if len(current_traj) >= 2:
+                trajectories.append({"segments": current_traj, "row_ids": current_rows})
+            current_traj, current_rows = [], []
+            continue
+
+        parts = [normalize_segment(p) for p in re.split(r"\s*(?:→|->)\s*", line) if normalize_segment(p)]
+        for piece in parts:
+            if piece in line_to_id:
+                current_traj.append(piece)
+                current_rows.append(line_to_id[piece])
+
+    if len(current_traj) >= 2:
+        trajectories.append({"segments": current_traj, "row_ids": current_rows})
+
     if not trajectories:
-        raise ValueError("No trajectories containing at least two usable segments.")
+        trajectories = [{"segments": all_data_lines, "row_ids": list(range(len(all_data_lines)))}]
+
     return trajectories
 
 
-def generate_synthetic_trajectories() -> List[List[str]]:
-    """Generates synthetic trajectories if no external data file is provided."""
-    return [
-        [
-            "The bedroom is cold.",
-            "Turn on the thermostat.",
-            "The heater starts warming up.",
-            "The bedroom is warm."
-        ],
-        [
-            "The kitchen light is off.",
-            "Walk to the light switch.",
-            "Flip the switch on.",
-            "The kitchen light is bright."
-        ],
-        [
-            "The front door is unlocked.",
-            "Reach for the door key.",
-            "Turn key to the right.",
-            "The front door is locked."
-        ]
-    ] * 20
+def generate_synthetic_corpus():
+    lines = [
+        "The bedroom is cold.",
+        "Turn on the thermostat.",
+        "The heater starts warming up.",
+        "The bedroom is warm.",
+        "The kitchen light is off.",
+        "Walk to the light switch.",
+        "Flip the switch on.",
+        "The kitchen light is bright.",
+        "The front door is unlocked.",
+        "Reach for the door key.",
+        "Turn key to the right.",
+        "The front door is locked."
+    ]
+    return lines, read_trajectories_from_lines(lines)
 
 
-def build_vectorizer(trajectories):
-    texts = [s for t in trajectories for s in t]
+def build_vectorizer(texts):
     vectorizer = layers.TextVectorization(
         max_tokens=VOCAB_SIZE,
         output_mode="int",
@@ -159,41 +158,49 @@ def augment_text(text: str) -> str:
 
 def make_training_examples(trajectories, depth):
     examples = []
-    for trajectory in trajectories:
+
+    for traj in trajectories:
+        trajectory = traj["segments"]
+        row_ids = traj["row_ids"]
+
         n = len(trajectory)
+
         for start in range(n - 1):
             horizon = min(depth, n - start - 1)
+
             if horizon < 1:
                 continue
+
             states = list(trajectory[start:start + horizon])
             next_states = list(trajectory[start + 1:start + horizon + 1])
+            target_rows = list(row_ids[start + 1:start + horizon + 1])
             goal = next_states[-1]
+
             while len(states) < depth:
                 states.append("")
                 next_states.append("")
+                target_rows.append(-1)
+
             examples.append({
                 "state": trajectory[start],
                 "goal": goal,
                 "step_states": states,
                 "next_states": next_states,
+                "target_row_ids": target_rows,
                 "horizon": horizon,
             })
+
     return examples
 
 
-def make_dataset(examples, vectorizer, depth, batch_size):
+def make_dataset(examples, all_line_ids, vectorizer, depth, batch_size):
     n = len(examples)
     state_ids = encode_texts([x["state"] for x in examples], vectorizer)
     goal_ids = encode_texts([x["goal"] for x in examples], vectorizer)
-    augmented_state_ids = encode_texts(
-        [augment_text(x["state"]) for x in examples], vectorizer
-    )
+    augmented_state_ids = encode_texts([augment_text(x["state"]) for x in examples], vectorizer)
     flat_next_states = [text for row in [x["next_states"] for x in examples] for text in row]
-    next_state_ids = tf.reshape(
-        encode_texts(flat_next_states, vectorizer), [n, depth, MAX_SEQ_LEN]
-    )
-    
-    action_ids = next_state_ids
+    next_state_ids = tf.reshape(encode_texts(flat_next_states, vectorizer), [n, depth, MAX_SEQ_LEN])
+
     horizons = np.asarray([x["horizon"] for x in examples], dtype=np.float32)
     step_idx = np.arange(depth, dtype=np.float32)[None, :]
     step_mask = (step_idx < horizons[:, None]).astype(np.float32)
@@ -203,18 +210,22 @@ def make_dataset(examples, vectorizer, depth, batch_size):
         if horizon > 0:
             termination_targets[i, horizon - 1] = 1.0
 
+    target_row_ids = np.asarray([x["target_row_ids"] for x in examples], dtype=np.int32)
+
+    # Broadcast line_ids across dataset batches
+    line_ids_batch = tf.tile(all_line_ids[None, ...], [n, 1, 1])
+
     ds = tf.data.Dataset.from_tensor_slices({
         "state_ids": state_ids,
         "goal_ids": goal_ids,
         "next_state_ids": next_state_ids,
-        "action_ids": action_ids,
         "step_mask": step_mask,
         "augmented_state_ids": augmented_state_ids,
         "termination_targets": termination_targets,
+        "target_row_ids": target_row_ids,
+        "line_ids": line_ids_batch,
     })
-    return ds.shuffle(
-        min(n, 4096), seed=SEED, reshuffle_each_iteration=True
-    ).batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
+    return ds.shuffle(min(n, 4096), seed=SEED, reshuffle_each_iteration=True).batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
 
 
 # ============================================================
@@ -253,9 +264,7 @@ class InceptionStateEncoder(layers.Layer):
         self.proj = layers.Dense(D_MODEL, activation="gelu")
         self.state_norm = layers.LayerNormalization()
         self.dropout = layers.Dropout(0.10)
-        self.value_head = tf.keras.Sequential([
-            layers.Dense(D_VALUE, activation="gelu"), layers.Dense(1)
-        ])
+        self.value_head = tf.keras.Sequential([layers.Dense(D_VALUE, activation="gelu"), layers.Dense(1)])
 
     def call(self, ids, training=False):
         ids = tf.cast(ids, tf.int32)
@@ -303,10 +312,7 @@ class ActionModel(layers.Layer):
     def call(self, state, goal):
         context = self.conditioner(state, goal)
         hidden = self.hidden(context)
-        actions = tf.reshape(
-            self.action_head(hidden),
-            [tf.shape(state)[0], NUM_ACTION_CANDIDATES, D_ACTION],
-        )
+        actions = tf.reshape(self.action_head(hidden), [tf.shape(state)[0], NUM_ACTION_CANDIDATES, D_ACTION])
         actions = tf.math.l2_normalize(actions, axis=-1)
         return {"context": context, "actions": actions, "logits": self.score_head(hidden)}
 
@@ -424,21 +430,16 @@ class RecursiveBellmanPlanner(layers.Layer):
         self.value_model = value_model
         self.plan_embedding_model = plan_embedding_model
 
-        self.trajectory_projection = tf.keras.Sequential([
-            layers.Dense(2 * D_PLAN, activation="gelu"),
-            layers.Dense(D_PLAN),
-            layers.LayerNormalization(),
-        ])
         self.termination_head = tf.keras.Sequential([
             layers.Dense(D_MODEL, activation="gelu"),
             layers.Dense(1),
         ])
 
-    def recursive_step(self, state, goal, observed_action=None, observed_next_state=None, training=False):
+    def recursive_step(self, state, goal, training=False):
         proposal = self.action_model(state, goal)
         actions = proposal["actions"]
         b, k = tf.shape(state)[0], tf.shape(actions)[1]
-        
+
         flat_state = tf.reshape(tf.broadcast_to(state[:, None, :], [b, k, tf.shape(state)[1]]), [-1, tf.shape(state)[1]])
         flat_goal = tf.reshape(tf.broadcast_to(goal[:, None, :], [b, k, tf.shape(goal)[1]]), [-1, tf.shape(goal)[1]])
         flat_actions = tf.reshape(actions, [-1, tf.shape(actions)[2]])
@@ -449,7 +450,7 @@ class RecursiveBellmanPlanner(layers.Layer):
 
         q_values = tf.reshape(flat_reward + GAMMA * flat_value, [b, k])
         index = tf.argmax(q_values, axis=-1, output_type=tf.int32)
-        
+
         selected_action = tf.gather(actions, index, batch_dims=1)
         predicted_next_state = self.transition_model(state, selected_action)
         predicted_reward = self.reward_model(state, selected_action, predicted_next_state, goal)
@@ -468,33 +469,50 @@ class RecursiveBellmanPlanner(layers.Layer):
         }
 
 
-class HierarchicalDecoder(layers.Layer):
-    """Sequence-to-sequence GRU action language decoder."""
-    def __init__(self, vocab_size):
+class HierarchicalPlanDecoder(layers.Layer):
+    """
+    Row-Selection Plan Decoder with Temperature-Scaled Softmax.
+    """
+    def __init__(self, d_model=D_MODEL, max_depth=MAX_SEGMENTS_PER_TRAJECTORY):
         super().__init__()
-        self.embedding = layers.Embedding(vocab_size, D_MODEL)
-        self.rnn = layers.GRU(D_MODEL, return_sequences=True)
-        self.dense = layers.Dense(vocab_size)
+        self.step_embedding = layers.Embedding(max_depth, d_model)
+        self.step_gru = layers.GRU(d_model, return_sequences=True)
+        self.plan_norm = layers.LayerNormalization()
 
-    def call(self, plan_embeddings, target_ids, training=False):
-        # Flatten batch and depth dimensions
-        b = tf.shape(plan_embeddings)[0]
-        d = tf.shape(plan_embeddings)[1]
-        
-        flat_plan = tf.reshape(plan_embeddings, [b * d, D_MODEL])
-        flat_targets = tf.reshape(target_ids, [b * d, MAX_SEQ_LEN])
-        
-        tok_embeds = self.embedding(flat_targets)
-        # Condition initial sequence step with plan embeddings
-        ctx_embeds = tok_embeds + flat_plan[:, None, :]
-        outputs = self.rnn(ctx_embeds, training=training)
-        logits = self.dense(outputs)
-        
-        return tf.reshape(logits, [b, d, MAX_SEQ_LEN, -1])
+        self.query_proj = layers.Dense(d_model)
+        self.line_proj = layers.Dense(d_model)
+        # After
+        self.temperature = self.add_weight(
+            name="temperature",
+            shape=(),
+            initializer=tf.constant_initializer(0.07),
+            trainable=True
+        )
+
+    def compute_step_contexts(self, plan_sequence, training=False):
+        depth = tf.shape(plan_sequence)[1]
+        positions = tf.range(depth)[None, :]
+        pos_embed = self.step_embedding(positions)
+        x = self.plan_norm(plan_sequence + pos_embed)
+        return self.step_gru(x, training=training)
+
+    def call(self, plan_sequence, line_embeddings, training=False):
+        step_contexts = self.compute_step_contexts(plan_sequence, training=training)
+
+        queries = tf.math.l2_normalize(self.query_proj(step_contexts), axis=-1)
+        keys = tf.math.l2_normalize(self.line_proj(line_embeddings), axis=-1)
+
+        row_logits = tf.matmul(queries, keys, transpose_b=True) / tf.maximum(self.temperature, 1e-4)
+
+        return {"row_logits": row_logits}
+
+    def predict_rows(self, plan_sequence, line_embeddings):
+        out = self(plan_sequence, line_embeddings, training=False)
+        return tf.argmax(out["row_logits"], axis=-1, output_type=tf.int32)
 
 
 # ============================================================
-# TRAINER MODULE (Decoupled Stage Optimizers & Loss Routing)
+# TRAINER MODULE
 # ============================================================
 class ModularPlannerTrainer(tf.keras.Model):
     def __init__(
@@ -527,23 +545,18 @@ class ModularPlannerTrainer(tf.keras.Model):
         self.opt_phase2 = tf.keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=WEIGHT_DECAY)
         self.opt_phase3 = tf.keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=WEIGHT_DECAY)
 
-    # ------------------------------------------------------------
-    # Phase 1: State & Action Representation Block Losses
-    # ------------------------------------------------------------
     def train_phase_1(self, batch):
         with tf.GradientTape() as tape:
             s_enc = self.encoder(batch["state_ids"], training=True)
             g_enc = self.encoder(batch["goal_ids"], training=True)
             s_aug_enc = self.encoder(batch["augmented_state_ids"], training=True)
-            
-            # 1. State Contrastive Loss
+
             sim_matrix = tf.matmul(s_enc["state"], s_aug_enc["state"], transpose_b=True) / CONTRASTIVE_TEMPERATURE
             labels = tf.range(tf.shape(sim_matrix)[0])
             loss_state_contrast = tf.reduce_mean(
                 tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=sim_matrix)
             )
 
-            # 2. Action Candidate Diversity Loss
             proposal = self.action_model(s_enc["state"], g_enc["state"])
             actions = proposal["actions"]
             actions_norm = tf.math.l2_normalize(actions, axis=-1)
@@ -553,14 +566,11 @@ class ModularPlannerTrainer(tf.keras.Model):
 
             loss_p1 = (W_STATE_CONTRAST * loss_state_contrast) + (W_CANDIDATE_DIVERSITY * loss_action_diversity)
 
-        # Collect trainable variables AFTER the forward pass so built sub-layers are included
         vars_phase1 = (
             self.encoder.trainable_variables +
             self.action_encoder.trainable_variables +
             self.action_model.trainable_variables
         )
-        
-        # Filter out any un-built/None gradients if any variable wasn't used
         grads = tape.gradient(loss_p1, vars_phase1)
         grads_and_vars = [(g, v) for g, v in zip(grads, vars_phase1) if g is not None]
 
@@ -571,16 +581,12 @@ class ModularPlannerTrainer(tf.keras.Model):
 
         return {"loss_p1": loss_p1}
 
-
-    # ------------------------------------------------------------
-    # Phase 2: Dynamics, Transition, and Value Block Losses
-    # ------------------------------------------------------------
     def train_phase_2(self, batch):
         with tf.GradientTape() as tape:
             s_enc = tf.stop_gradient(self.encoder(batch["state_ids"], training=False)["state"])
             g_enc = tf.stop_gradient(self.encoder(batch["goal_ids"], training=False)["state"])
             s_next_true = tf.stop_gradient(self.encoder(batch["next_state_ids"][:, 0, :], training=False)["state"])
-            
+
             a_latent = tf.stop_gradient(self.action_encoder(s_enc, s_next_true))
             s_next_pred = self.transition_model(s_enc, a_latent)
             loss_transition = tf.reduce_mean(1.0 - tf.reduce_sum(s_next_pred * s_next_true, axis=-1))
@@ -588,7 +594,7 @@ class ModularPlannerTrainer(tf.keras.Model):
             val_current = self.value_model(s_enc, g_enc)
             val_next = self.value_model(s_next_pred, g_enc)
             reward_pred = self.reward_model(s_enc, a_latent, s_next_pred, g_enc)
-            
+
             bellman_target = tf.stop_gradient(reward_pred + GAMMA * val_next)
             loss_bellman = tf.reduce_mean(tf.square(val_current - bellman_target))
 
@@ -609,56 +615,45 @@ class ModularPlannerTrainer(tf.keras.Model):
 
         return {"loss_p2": loss_p2}
 
-    # ------------------------------------------------------------
-    # Phase 3: Recursive Planner & Decoder Losses
-    # ------------------------------------------------------------
     def train_phase_3(self, batch):
         with tf.GradientTape() as tape:
-            s_enc = self.encoder(batch["state_ids"], training=False)["state"]
-            g_enc = self.encoder(batch["goal_ids"], training=False)["state"]
-            
-            # Dynamic planning horizon depth
+            s_enc = self.encoder(batch["state_ids"], training=True)["state"]
+            g_enc = self.encoder(batch["goal_ids"], training=True)["state"]
+
             horizon_depth = tf.shape(batch["next_state_ids"])[1]
             batch_size = tf.shape(s_enc)[0]
-            
+
             curr_state = s_enc
             plan_steps, term_logits = [], []
             loss_recursive_drift = 0.0
 
-            # Dynamic unroll loop over planning horizon
+            # Unroll planner self-consistently
             for t in range(PLANNER_DEPTH):
-                # Mask out-of-bounds steps beyond dynamic horizon
                 is_active = tf.cast(t < horizon_depth, tf.float32)
-                
-                # Fetch next state safely
                 t_idx = tf.minimum(t, horizon_depth - 1)
-                obs_next = self.encoder(batch["next_state_ids"][:, t_idx, :], training=False)["state"]
-                obs_action = self.action_encoder(curr_state, obs_next)
-                
+
+                obs_next = tf.stop_gradient(self.encoder(batch["next_state_ids"][:, t_idx, :], training=False)["state"])
+
                 step_out = self.planner.recursive_step(
                     state=curr_state,
                     goal=g_enc,
-                    observed_action=obs_action,
-                    observed_next_state=obs_next,
                     training=True
                 )
-                
+
                 plan_steps.append(step_out["plan_embedding"])
                 term_logits.append(step_out["termination_logit"])
-                
+
                 step_drift = (1.0 - tf.reduce_sum(step_out["next_state"] * obs_next, axis=-1))
                 loss_recursive_drift += tf.reduce_mean(step_drift * batch["step_mask"][:, t_idx] * is_active)
-                
+
                 curr_state = step_out["next_state"]
 
             loss_recursive_drift = tf.reduce_mean(loss_recursive_drift)
-            # Stack logits across unrolled steps -> shape: (32, 4)
             term_logits = tf.stack(term_logits, axis=1)
-            
-            # Slice termination_targets to match the actual number of unrolled logits steps
+
             num_unrolled_steps = tf.shape(term_logits)[1]
             target_labels = batch["termination_targets"][:, :num_unrolled_steps]
-            
+
             loss_termination = tf.reduce_mean(
                 tf.nn.sigmoid_cross_entropy_with_logits(
                     labels=target_labels, logits=term_logits
@@ -668,41 +663,27 @@ class ModularPlannerTrainer(tf.keras.Model):
             plan_seq = tf.stack(plan_steps, axis=1)[:, :horizon_depth, :]
             decoder_input = self.plan_projection(plan_seq)
 
-            # ------------------------------------------------------------
-            # Row-Classification Decoder Loss (data.txt candidate lines)
-            # ------------------------------------------------------------
-            # Option A: Batch contains 'line_ids' [B, Num_Lines, MAX_SEQ_LEN]
-            if "line_ids" in batch:
-                flat_line_ids = tf.reshape(batch["line_ids"], [-1, MAX_SEQ_LEN])
-                encoded_lines = self.encoder(flat_line_ids, training=False)["state"]
-                num_lines = tf.shape(batch["line_ids"])[1]
-                line_embeddings = tf.reshape(encoded_lines, [batch_size, num_lines, D_MODEL])
-            else:
-                # Option B: Fallback to next_state_ids as action line candidates [B, depth, D_MODEL]
-                flat_next = tf.reshape(batch["next_state_ids"], [-1, MAX_SEQ_LEN])
-                line_embeddings = tf.reshape(
-                    self.encoder(flat_next, training=False)["state"], 
-                    [batch_size, horizon_depth, D_MODEL]
-                )
+            # Global Corpus Line Encoding (Allow gradient flow to encoder)
+            flat_line_ids = tf.reshape(batch["line_ids"], [-1, MAX_SEQ_LEN])
+            encoded_lines = self.encoder(flat_line_ids, training=True)["state"]
+            num_lines = tf.shape(batch["line_ids"])[1]
+            line_embeddings = tf.reshape(encoded_lines, [batch_size, num_lines, D_MODEL])
 
-            # Forward pass through row-matching decoder -> row_logits: [B, depth, Num_Lines]
-            # Forward pass through row-matching decoder -> row_logits: [B, depth, Num_Lines]
             dec_out = self.decoder(decoder_input, line_embeddings, training=True)
-            
-            # Match the exact number of unrolled steps (e.g., 4)
+
             num_unrolled_steps = tf.shape(dec_out["row_logits"])[1]
+            target_rows = batch["target_row_ids"][:, :num_unrolled_steps]
+            valid_mask = batch["step_mask"][:, :num_unrolled_steps]
 
-            # Target row indices per step
-            if "target_row_ids" in batch:
-                target_rows = batch["target_row_ids"][:, :num_unrolled_steps]
-            else:
-                target_rows = tf.tile(tf.range(num_unrolled_steps)[None, :], [batch_size, 1])
-
-            loss_decoder = tf.reduce_mean(
-                tf.keras.losses.sparse_categorical_crossentropy(
-                    target_rows, dec_out["row_logits"], from_logits=True
-                )
+            safe_target_rows = tf.maximum(target_rows, 0)
+            decoder_ce = tf.keras.losses.sparse_categorical_crossentropy(
+                safe_target_rows,
+                dec_out["row_logits"],
+                from_logits=True
             )
+            decoder_ce *= valid_mask
+
+            loss_decoder = tf.reduce_sum(decoder_ce) / tf.maximum(tf.reduce_sum(valid_mask), 1.0)
 
             loss_p3 = (
                 (W_RECURSIVE_STATE * loss_recursive_drift) +
@@ -710,7 +691,9 @@ class ModularPlannerTrainer(tf.keras.Model):
                 (W_DECODER * loss_decoder)
             )
 
+        # Include self.encoder variables so Phase 3 shapes candidate line embeddings
         vars_phase3 = (
+            self.encoder.trainable_variables +
             self.plan_embedding_model.trainable_variables +
             self.plan_projection.trainable_variables +
             self.planner.trainable_variables +
@@ -726,148 +709,30 @@ class ModularPlannerTrainer(tf.keras.Model):
 
         return {"loss_p3": loss_p3}
 
-# ============================================================
-# HIERARCHICAL DECODER
-# ============================================================
-class HierarchicalPlanDecoder(layers.Layer):
-    """
-    Row-Selection Plan Decoder.
-    
-    Given plan step embeddings [B, Depth, D_MODEL] and candidate line/row embeddings 
-    from data.txt [B, Num_Lines, D_MODEL], predicts the matching line index for each step.
-    """
-    def __init__(self, d_model=D_MODEL, max_depth=MAX_SEGMENTS_PER_TRAJECTORY):
-        super().__init__()
-        self.step_embedding = layers.Embedding(max_depth, d_model)
-        self.step_gru = layers.GRU(d_model, return_sequences=True)
-        self.plan_norm = layers.LayerNormalization()
-
-        # Projections for bilinear matching between steps and line candidates
-        self.query_proj = layers.Dense(d_model)
-        self.line_proj = layers.Dense(d_model)
-
-    def compute_step_contexts(self, plan_sequence, training=False):
-        depth = tf.shape(plan_sequence)[1]
-        positions = tf.range(depth)[None, :]
-        pos_embed = self.step_embedding(positions)
-        x = self.plan_norm(plan_sequence + pos_embed)
-        return self.step_gru(x, training=training)
-
-    def call(self, plan_sequence, line_embeddings, training=False):
-        """
-        Args:
-            plan_sequence:   [B, Depth, D_MODEL]
-            line_embeddings: [B, Num_Lines, D_MODEL] (Encoded lines from data.txt)
-            
-        Returns:
-            Dict containing:
-                'row_logits': [B, Depth, Num_Lines]
-        """
-        # 1. Step representations across time depth: [B, Depth, D_MODEL]
-        step_contexts = self.compute_step_contexts(plan_sequence, training=training)
-        
-        # 2. Project step queries and line candidate keys
-        queries = self.query_proj(step_contexts)     # [B, Depth, D_MODEL]
-        keys = self.line_proj(line_embeddings)       # [B, Num_Lines, D_MODEL]
-
-        # 3. Compute matching score logits: [B, Depth, Num_Lines]
-        row_logits = tf.matmul(queries, keys, transpose_b=True)
-
-        return {"row_logits": row_logits}
-
-    def predict_rows(self, plan_sequence, line_embeddings):
-        """
-        Predicts the best-matching data.txt line index per step.
-        
-        Returns:
-            predicted_row_indices: [B, Depth] (int32)
-        """
-        out = self(plan_sequence, line_embeddings, training=False)
-        return tf.argmax(out["row_logits"], axis=-1, output_type=tf.int32)
-# ============================================================
-# INFERENCE & DECODING HELPERS
-# ============================================================
-
 
 # ============================================================
 # INFERENCE & PLAN PRINTING
 # ============================================================
-def sample_token(logits, temperature=0.6, top_k=40, top_p=0.92):
-    logits = logits / max(temperature, 1e-5)
-    
-    if top_k > 0:
-        values, _ = tf.math.top_k(logits, k=min(top_k, tf.shape(logits)[-1]))
-        min_value = values[:, -1:]
-        logits = tf.where(logits < min_value, tf.cast(-1e9, logits.dtype), logits)
-        
-    if top_p < 1.0:
-        sorted_logits = tf.sort(logits, direction='DESCENDING', axis=-1)
-        sorted_probs = tf.nn.softmax(sorted_logits, axis=-1)
-        cumulative_probs = tf.math.cumsum(sorted_probs, axis=-1)
-        
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove = tf.concat(
-            [tf.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, :-1]], axis=-1
-        )
-        
-        # Mask out logits above top_p cumulative threshold
-        cutoff = tf.reduce_min(tf.where(sorted_indices_to_remove, sorted_logits, tf.cast(1e9, logits.dtype)), axis=-1, keepdims=True)
-        logits = tf.where(logits < cutoff, tf.cast(-1e9, logits.dtype), logits)
-        
-    return tf.cast(tf.random.categorical(logits, num_samples=1)[:, 0], tf.int32)
+def decode_and_print_plan(decoder, plan_projection, plan_step_embeddings, encoder, vectorizer, all_data_lines):
+    line_token_ids = encode_texts(all_data_lines, vectorizer)
+    encoded_candidates = encoder(line_token_ids, training=False)["state"]
+    candidate_embeds = tf.expand_dims(encoded_candidates, axis=0)
 
+    plan_seq = tf.stack(plan_step_embeddings, axis=1)
+    decoder_input = plan_projection(plan_seq)
 
-
-def decode_and_print_plan(decoder, plan_projection, plan_step_embeddings, data_path_or_actions):
-    """
-    Decodes step embeddings by predicting row numbers from data.txt (or action list).
-    
-    Args:
-        decoder: HierarchicalPlanDecoder instance.
-        plan_projection: PlanSentenceProjection instance.
-        plan_step_embeddings: List of plan step tensors.
-        data_path_or_actions: Path to data.txt file OR list of string actions.
-    """
-    # 1. Load data lines/actions if a file path is provided
-    if isinstance(data_path_or_actions, str):
-        if not os.path.exists(data_path_or_actions):
-            raise FileNotFoundError(f"Corpus file not found: {data_path_or_actions}")
-        with open(data_path_or_actions, "r", encoding="utf-8") as f:
-            # Clean and read non-empty lines
-            action_lines = [line.strip() for line in f if line.strip()]
-    else:
-        action_lines = data_path_or_actions
-
-    num_actions = len(action_lines)
-    if num_actions == 0:
-        print("Warning: Action list is empty.")
-        return
-
-    # 2. Project plan embeddings
-    plan_seq = tf.stack(plan_step_embeddings, axis=1)  # [1, depth, D_PLAN]
-    decoder_input = plan_projection(plan_seq)          # [1, depth, D_MODEL]
-
-    # 3. Create candidate action embeddings for span/row prediction lookup
-    # Shape: [1, num_actions, D_MODEL]
-    action_indices = tf.range(num_actions, dtype=tf.int32)[None, :]
-    candidate_embeds = tf.one_hot(action_indices, num_actions)
-
-    # 4. Predict target row indices
-    # starts will contain the predicted row index for each step: [1, depth]
-    predicted_row_ids, _ = decoder.predict_spans(decoder_input, candidate_embeds)
+    predicted_row_ids = decoder.predict_rows(decoder_input, candidate_embeds)
     predicted_row_ids = predicted_row_ids[0].numpy()
 
-    # 5. Retrieve lines by predicted row number and print
+    print("\n--- Decoded Plan Steps ---")
     for step_idx, row_idx in enumerate(predicted_row_ids, 1):
-        # Clamp row index within valid bounds
-        clamped_idx = max(0, min(row_idx, num_actions - 1))
-        matched_action = action_lines[clamped_idx]
-        
+        clamped_idx = max(0, min(row_idx, len(all_data_lines) - 1))
+        matched_action = all_data_lines[clamped_idx]
         print(f" Step {step_idx} (Row {clamped_idx}): {matched_action}")
 
-        
+
 # ============================================================
-# UPDATED MAIN PIPELINE
+# MAIN PIPELINE
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(description="Self-Supervised Bellman Planner")
@@ -875,21 +740,24 @@ def main():
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size.")
     parser.add_argument("--depth", type=int, default=PLANNER_DEPTH, help="Planning horizon depth.")
-    parser.add_argument("--state", type=str, default="The bedroom is cold.", help="Initial state query.")
-    parser.add_argument("--goal", type=str, default="The bedroom is warm.", help="Goal state query.")
+    parser.add_argument("--state", type=str, default="The kitchen is dirty.", help="Initial state query.")
+    parser.add_argument("--goal", type=str, default="The kitchen is clean.", help="Goal state query.")
     args = parser.parse_args()
 
-    # 1. Dataset Initialization
+    # 1. Dataset & Canonical Lines Initialization
     if args.data and os.path.exists(args.data):
-        trajectories = read_trajectories(args.data)
+        all_data_lines = read_data_lines(args.data)
+        trajectories = read_trajectories_from_lines(all_data_lines)
     else:
-        trajectories = generate_synthetic_trajectories()
+        all_data_lines, trajectories = generate_synthetic_corpus()
 
-    vectorizer = build_vectorizer(trajectories)
+    vectorizer = build_vectorizer(all_data_lines)
     actual_vocab_size = len(vectorizer.get_vocabulary()) + SPECIAL_TOKENS + 10
-    
+
+    all_line_ids = encode_texts(all_data_lines, vectorizer)
+
     examples = make_training_examples(trajectories, args.depth)
-    dataset = make_dataset(examples, vectorizer, args.depth, args.batch_size)
+    dataset = make_dataset(examples, all_line_ids, vectorizer, args.depth, args.batch_size)
 
     # 2. Instantiate Network Components
     state_encoder = InceptionStateEncoder(actual_vocab_size)
@@ -900,16 +768,14 @@ def main():
     value_model = ValueModel()
     plan_embedding_model = PlanEmbeddingModel()
     plan_projection = PlanSentenceProjection()
-    
+
     planner = RecursiveBellmanPlanner(
         action_model, transition_model, reward_model, value_model, plan_embedding_model
     )
-    
-    # Instantiate the Hierarchical Decoder
-    # In main():
+
     decoder = HierarchicalPlanDecoder(
         d_model=D_MODEL,
-        max_depth=args.depth + 1  # Ensures embedding table covers depth indices
+        max_depth=args.depth + 1
     )
 
     trainer = ModularPlannerTrainer(
@@ -958,21 +824,26 @@ def main():
 
     s_ids = encode_texts([args.state], vectorizer)
     g_ids = encode_texts([args.goal], vectorizer)
-    
+
     s_init = state_encoder(s_ids, training=False)["state"]
     g_init = state_encoder(g_ids, training=False)["state"]
 
     curr_state = s_init
     plan_step_embeddings = []
 
-    # Roll out latent Bellman trajectory search
     for step in range(args.depth):
         step_out = planner.recursive_step(curr_state, g_init, training=False)
         plan_step_embeddings.append(step_out["plan_embedding"])
         curr_state = step_out["next_state"]
 
-    # Decode latent trajectory with full hierarchical context
-    decode_and_print_plan(decoder, plan_projection, plan_step_embeddings, vectorizer)
+    decode_and_print_plan(
+        decoder=decoder,
+        plan_projection=plan_projection,
+        plan_step_embeddings=plan_step_embeddings,
+        encoder=trainer.encoder,
+        vectorizer=vectorizer,
+        all_data_lines=all_data_lines
+    )
     print("==================================================\n")
 
 
